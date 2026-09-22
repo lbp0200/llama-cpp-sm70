@@ -124,6 +124,47 @@ __device__ __forceinline__ void load_kv_f16_to_smem(
 } // namespace ggml_cuda_fattn_v100
 
 // ---------------------------------------------------------------------------
+// Side kernel: per-query-row visibility ceiling (number of non-masked keys).
+// One block per row, reads the f16 mask row and finds the last non -inf column.
+// The result bounds the KV scan of the main kernel below without any in-kernel
+// mask scan (matches the reference kernels' causal/sliding visibility exactly; a
+// fully-visible mask yields kv_max[row] == N).
+// ---------------------------------------------------------------------------
+__global__ static void fattn_v100_mask_kvmax(
+        const half * __restrict__ mask, int * __restrict__ kv_max,
+        const int N, const int M, const int64_t row_stride) {
+    const int row = blockIdx.x;
+    if (row >= M) {
+        return;
+    }
+    const char * mrow = reinterpret_cast<const char *>(mask) + (int64_t) row * row_stride;
+    int last = -1;
+    for (int i = threadIdx.x; i < N; i += blockDim.x) {
+        const float mv = __half2float(__ldg(reinterpret_cast<const half *>(mrow) + i));
+        if (mv != -INFINITY) {
+            last = i; // ascending scan: later columns overwrite
+        }
+    }
+#pragma unroll
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        last = max(last, __shfl_down_sync(0xFFFFFFFFu, last, off));
+    }
+    __shared__ int red[8]; // 256 threads / 32 per warp
+    if (threadIdx.x % WARP_SIZE == 0) {
+        red[threadIdx.x / WARP_SIZE] = last;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int c = -1;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            c = max(c, red[w]);
+        }
+        kv_max[row] = c >= 0 ? c + 1 : 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Device kernel. One block handles BLOCK_M query rows of one (batch, head) and
 // walks the full causal KV range in BLOCK_N chunks.
 // ---------------------------------------------------------------------------
@@ -133,6 +174,7 @@ flash_attn_ext_v100_kernel(
         const char * __restrict__ K_ptr,
         const char * __restrict__ V_ptr,
         const char * __restrict__ mask_ptr,
+        const int    * __restrict__ kv_max,
         const float * __restrict__ sinks_ptr,
         char       * __restrict__ dst_ptr,
         const int32_t M, const int32_t N,
@@ -164,11 +206,28 @@ flash_attn_ext_v100_kernel(
 
     const int valid_q_rows = min(BLOCK_M, M - start_row);
 
-    // v1 correctness: walk the full KV range and let the mask decide visibility.
-    // Geometric causal truncation is NOT safe here: masks can be all-visible or
-    // sink-shaped, and truncating would drop valid keys. (A causal-only fast path
-    // that scans the mask for the per-row CEIL is a later perf optimization.)
-    const int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
+    // v2: block-level visibility ceiling from a host-precomputed kv_max array.
+    // The ceiling of the block's last query row bounds how far this block scans;
+    // rows that are narrower inside the block stay exact via the per-element mask
+    // adds, so this is safe for any mask shape (causal, sliding, all-visible,
+    // sink). kv_max == nullptr means "no mask": scan the full range.
+    int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
+    if (kv_max != nullptr) {
+        const int ceiling = kv_max[start_row + valid_q_rows - 1];
+        if (ceiling <= 0) {
+            // no visible key for any row in this block: zero output and return
+            const int n4 = valid_q_rows * (D / 4);
+            for (int i = tid; i < n4; i += THREADS_PER_BLOCK) {
+                const int row = i / (D / 4);
+                const int col = (i - row * (D / 4)) * 4;
+                *reinterpret_cast<float4 *>(dst_ptr
+                    + stride_D3 * batch_id + (int64_t) q_head_id * stride_D1
+                    + (int64_t) (start_row + row) * stride_D2 + (int64_t) col * sizeof(float)) = make_float4(0.f, 0.f, 0.f, 0.f);
+            }
+            return;
+        }
+        num_n_tiles = min(num_n_tiles, (ceiling + BLOCK_N - 1) / BLOCK_N);
+    }
 
     const char * q_base = Q_ptr + stride_Q3 * batch_id + stride_Q2 * q_head_id;
     const char * k_base = K_ptr + stride_K3 * batch_id + stride_K2 * kv_head_id;
@@ -562,6 +621,23 @@ void ggml_cuda_flash_attn_ext_v100(ggml_backend_cuda_context & ctx, ggml_tensor 
 
     cudaStream_t main_stream = ctx.stream();
 
+    // Per-row visibility ceiling from the mask (causal/sliding skip). The side
+    // kernel runs inside the capture region, so the buffer must be allocated
+    // before capture starts: grab it from the context pool here.
+    ggml_cuda_pool & pool = ctx.pool();
+    ggml_cuda_pool_alloc<int> kv_max_buf(pool);
+    int * kv_max_ptr = nullptr;
+    if (mask != nullptr) {
+        kv_max_buf.alloc(M);
+        kv_max_ptr = kv_max_buf.ptr;
+        const dim3 kv_blocks(M, 1, 1);
+        const dim3 kv_threads(256, 1, 1);
+        const ggml_cuda_kernel_launch_params kv_params(kv_blocks, kv_threads, 0, main_stream);
+        ggml_cuda_kernel_launch(fattn_v100_mask_kvmax, kv_params,
+            (const half *) mask->data, kv_max_ptr, N, M, (int64_t) mask->nb[1]);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     const dim3 block_dim(ggml_cuda_fattn_v100::THREADS_PER_BLOCK, 1, 1);
     const dim3 blocks_num((M + ggml_cuda_fattn_v100::BLOCK_M - 1) / ggml_cuda_fattn_v100::BLOCK_M, 1, H);
 
@@ -577,6 +653,7 @@ void ggml_cuda_flash_attn_ext_v100(ggml_backend_cuda_context & ctx, ggml_tensor 
         (const char *) K->data,
         (const char *) V->data,
         (const char *) mask->data,
+        kv_max_ptr,
         sinks ? (const float *) sinks->data : nullptr,
         (char *) dst->data,
         M, N, H, H_KV,
