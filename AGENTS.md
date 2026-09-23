@@ -39,6 +39,57 @@ llama-cli -m model.gguf -c 8192 -ngl 99 --cache-type-k q8_0 --cache-type-v turbo
 
 Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is supported. Turbo cache types require flash attention; it is auto-enabled with a warning. Quantized V with FA explicitly disabled is an error (upstream behavior). The same flags work in `llama-server`, `llama-bench`, `llama-perplexity`.
 
+### SM75 dev/test target (RTX 2070, 10.1.2.16)
+
+- The 10.1.2.16 box (RTX 2070 / sm_75, 8 GB) is our fast-iteration test GPU. Its
+  production services were migrated away and disabled (never relied on it being
+  free; someone may bring them back):
+  ```bash
+  ssh bolt-remote   # ssh alias (HostName 10.1.2.16)
+  sudo systemctl disable --now llama-server.service llama-gateway.service
+  ```
+- **Final target model on the 2070: `translategemma-4b-it.i1-Q4_K_M.gguf`**
+  (~2.5 GB, `~/models/` on the box, also mirrored under `~/Models/` on the dev
+  Mac). It is the reference for all SM75 A/B: head_dim 256, GQA 2, f16 KV
+  friendly, and it exercises the Volta FA kernel gate
+  (`GGML_V100_FA`, cc == 700 || cc == 750 WIP).
+- Build on the box: `cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75`.
+- The V100 box (192.168.7.3, sm_70, 32 GB) stays the large-model/long-context
+  validation environment (Qwen3.8-27B IQ4_XS etc.).
+- Volta/SM75 FA work lives on branch `feature/v100-fa-port`
+  (`ggml-cuda/fattn-v100.cuh` + the graph null-deref fix).
+
+### SM75 optimization reference (vLLM-2080Ti-Definitive)
+
+Study the Turing optimization reference at `/Users/lbp/SharedData/vLLM-2080Ti-Definitive`
+(a dual-RTX-2080Ti / SM75 vLLM fork by `weicj`) before making SM75-specific
+kernel or runtime decisions. Its validated SM75 stack, in rough value order:
+
+- **FlashInfer / FlashQLA-SM70-SM75** (`weicj/FlashQLA-SM70-SM75`): the prefill
+  attention route for Qwen on Turing; see also its `csrc/attention/` headers.
+- **Marlin** quantized GEMM (W4A16/W8A16) - the model-weight side of SM75.
+- **TurboQuant / INT8-FP8 KV cache** - compressing KV on a bandwidth-starved card.
+- **CUDA Graph (FULL/PIECEWISE + AOT)** - Turing graphs are valuable, never
+  disable them to "fix" a bug; fix the underlying bug instead.
+- **MTP / DFlash2 speculative decoding** - decode token/s on sm_75 is low
+  (~30-40 tok/s raw), speculation is how Turing serving stays responsive.
+
+Evidence from that repo (Qwen3.8-27B on 2x2080Ti 22GB, TP2, FP16 KV, no
+speculation): prefill 4K token ~1694 tok/s, decode ~33 tok/s; with MTP/4 or
+DFlash2 decode jumps to ~95-220 tok/s. 145-512K contexts validated. So SM75 can
+serve large models fast at prefill while decode needs speculation.
+
+Applicability boundary for our 2070 (8 GB, single card, no NVLink):
+- TP2/multi-card profiles DO NOT apply.
+- Weights above ~7 GB do not fit; the 2070 target stays `translategemma-4b`
+  (D=256, GQA 2) unless we go smaller/denser.
+- The attention-kernel and CUDA-graph lessons DO apply to our fork
+  (`feature/v100-fa-port` Volta FA dataflow, low-smem Turing variant,
+  graph null-deref fix).
+
+Fork/TurboQuant overlaps: the repo's TQ4NC KV cache ciphertext matches our
+fork's turbo KV family in spirit (both bound KV bytes on Turing-class cards).
+
 ### Environment knobs
 
 | Variable                    | Default | Effect |
