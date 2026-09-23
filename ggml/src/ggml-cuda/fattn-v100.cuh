@@ -250,13 +250,19 @@ flash_attn_ext_v100_kernel(
 
     const int valid_q_rows = min(CFG::BLOCK_M, M - start_row);
 
-    // v2: block-level visibility ceiling from a precomputed kv_max array. The
-    // ceiling of the block's last query row bounds how far this block scans;
-    // rows that are narrower inside the block stay exact via the per-element
-    // mask adds, so this is safe for any mask shape (causal, SWA, all-visible,
-    // sink). kv_max == nullptr means no mask: scan the full range.
+    // v2: block-level visibility ceiling from a precomputed kv_max array. Take
+    // the MAX over this block's rows: only columns every row masks out are
+    // skipped, so any mask shape (causal, SWA, random, all-visible, sink) stays
+    // exact; rows narrower inside the block stay exact through the per-element
+    // mask adds. kv_max == nullptr means no mask: full scan.
     int num_n_tiles = (N + CFG::BLOCK_N - 1) / CFG::BLOCK_N;
-    const int kv_ceiling = (kv_max != nullptr) ? kv_max[start_row + valid_q_rows - 1] : -1;
+    int kv_ceiling = -1;
+    if (kv_max != nullptr) {
+        kv_ceiling = 0;
+        for (int r = 0; r < valid_q_rows; ++r) {
+            kv_ceiling = max(kv_ceiling, kv_max[start_row + r]);
+        }
+    }
     if (kv_ceiling >= 0) {
         num_n_tiles = min(num_n_tiles, (kv_ceiling + CFG::BLOCK_N - 1) / CFG::BLOCK_N);
     }
