@@ -16,6 +16,35 @@
 
 </div>
 
+## About this fork
+
+This is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) that keeps
+the upstream tree fully synced and adds two things for older NVIDIA GPUs:
+
+- **TurboQuant KV cache** - `turbo2`, `turbo3`, `turbo4` cache types plus the
+  `tq3_1s` / `tq4_1s` weight types. A fixed 128x128 Walsh-Hadamard rotation is
+  applied before quantization, which compresses the KV cache far beyond
+  `q8_0` with little quality loss. See
+  [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md).
+- **Volta / Turing FlashAttention kernel** - a split-D WMMA port (1Cat dataflow)
+  for `D = 256` attention with fp32 score smem, sub-tile softmax and a
+  mask-derived KV scan bound for causal/SWA prefill. Enabled by default on
+  `cc == 700` (V100) and `cc == 750` (RTX 20xx); `GGML_V100_FA=0` falls back
+  to the upstream kernels.
+
+Target hardware and what it is used for:
+
+- **V100 (SM70, 32 GB)**: performance target for large models and long context
+  (validated with Qwen3.8-27B IQ4_XS, f16 KV, up to 64K tokens).
+- **RTX 2070 (SM75, 8 GB)**: fast iteration; reference model
+  `translategemma-4b` (`head_dim` 256, GQA 2).
+
+Correctness is gated by `test-backend-ops` (`FLASH_ATTN_EXT` 470/470 for
+`hsk=256` and 7764/7764 for `hsk` 64..640) and by real-model A/B runs. The
+Turing results are validated on the RTX 2070; the Volta path uses the same
+kernels and gates but still needs a re-run on the V100 after the Turing
+fragment fix. Build, test and commit conventions live in [AGENTS.md](AGENTS.md).
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
