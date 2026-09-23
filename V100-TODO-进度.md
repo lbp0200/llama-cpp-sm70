@@ -305,6 +305,19 @@ GGML_V100_FA=0    # 立即回到旧路径
      或等价的 KV 分段 grid 重构；Q_in_reg 次之。或在上游 issue #28037 语境下
      与维护者对齐优化路线。
 
+## 2070 回线验证（task-6，条件跳过，2026-09-24 07:24 记录）
+
+- 07:17:17 窗口过后共 4 次 SSH 探测（07:18:30 一次 + 07:19~07:24 三次，
+  ConnectTimeout 12-15s）全部 `Connection timed out` —— 2070 未回线。
+- 按 task-6 合同条款跳过，不阻塞目标。
+- **回线后手动补做清单**：
+  ```bash
+  cd ~/llama-cpp-sm70 && git pull    # 至 9a2a876d3+
+  ./build/bin/test-backend-ops -o FLASH_ATTN_EXT -p "hsk=256"   # 期望 470/470
+  ./build/bin/llama-cli -m ~/models/translategemma-4b-it.i1-Q4_K_M.gguf \
+      -p "Translate to English: Bonjour le monde." -n 50 --no-jinja  # -> Hello world.
+  ```
+
 ## 下一步 TODO（按优先级）
 
 ### T-A. v2 调试（根因定位）
