@@ -150,6 +150,46 @@ __device__ __forceinline__ void load_kv_f16_to_smem(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Side kernel: per-query-row visibility ceiling (number of non-masked keys).
+// One block per row; finds the last non -inf column of the f16 mask row. This
+// bounds the main kernel's KV scan (causal/SWA skip) without in-kernel sync.
+// A fully-visible mask yields kv_max[row] == N; a fully masked row yields 0.
+// ---------------------------------------------------------------------------
+__global__ static void fattn_v100_mask_kvmax_kernel(
+        const half * __restrict__ mask, int * __restrict__ kv_max,
+        const int N, const int M, const int64_t row_stride) {
+    const int row = blockIdx.x;
+    if (row >= M) {
+        return;
+    }
+    const char * mrow = reinterpret_cast<const char *>(mask) + (int64_t) row * row_stride;
+    int last = -1;
+    for (int i = threadIdx.x; i < N; i += blockDim.x) {
+        const float mv = __half2float(__ldg(reinterpret_cast<const half *>(mrow) + i));
+        if (mv != -INFINITY) {
+            last = i; // ascending scan: later columns overwrite
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        last = max(last, __shfl_down_sync(0xFFFFFFFFu, last, off));
+    }
+    __shared__ int red[8]; // 256 threads / 32 per warp
+    if (threadIdx.x % 32 == 0) {
+        red[threadIdx.x / 32] = last;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int c = -1;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            c = max(c, red[w]);
+        }
+        kv_max[row] = c >= 0 ? c + 1 : 0;
+    }
+}
+
 } // namespace ggml_cuda_fattn_v100
 
 // ---------------------------------------------------------------------------
@@ -163,6 +203,7 @@ flash_attn_ext_v100_kernel(
         const char * __restrict__ K_ptr,
         const char * __restrict__ V_ptr,
         const char * __restrict__ mask_ptr,
+        const int * __restrict__ kv_max,
         const float * __restrict__ sinks_ptr,
         char       * __restrict__ dst_ptr,
         const int32_t M, const int32_t N,
@@ -209,11 +250,16 @@ flash_attn_ext_v100_kernel(
 
     const int valid_q_rows = min(CFG::BLOCK_M, M - start_row);
 
-    // v1 correctness: walk the full KV range and let the mask decide visibility.
-    // Geometric causal truncation is NOT safe here: masks can be all-visible or
-    // sink-shaped, and truncating would drop valid keys. (A causal-only fast path
-    // that scans the mask for the per-row CEIL is a later perf optimization.)
-    const int num_n_tiles = (N + CFG::BLOCK_N - 1) / CFG::BLOCK_N;
+    // v2: block-level visibility ceiling from a precomputed kv_max array. The
+    // ceiling of the block's last query row bounds how far this block scans;
+    // rows that are narrower inside the block stay exact via the per-element
+    // mask adds, so this is safe for any mask shape (causal, SWA, all-visible,
+    // sink). kv_max == nullptr means no mask: scan the full range.
+    int num_n_tiles = (N + CFG::BLOCK_N - 1) / CFG::BLOCK_N;
+    const int kv_ceiling = (kv_max != nullptr) ? kv_max[start_row + valid_q_rows - 1] : -1;
+    if (kv_ceiling >= 0) {
+        num_n_tiles = min(num_n_tiles, (kv_ceiling + CFG::BLOCK_N - 1) / CFG::BLOCK_N);
+    }
 
     const char * q_base = Q_ptr + stride_Q3 * batch_id + stride_Q2 * q_head_id;
     const char * k_base = K_ptr + stride_K3 * batch_id + stride_K2 * kv_head_id;
@@ -232,6 +278,19 @@ flash_attn_ext_v100_kernel(
     // FA output is permute(0,2,1,3): bytes map as [D][H][M][B], so the head
     // stride is nb[1] and the token stride is nb[2] (see ggml_flash_attn_ext).
     char *       d_base = dst_ptr + stride_D3 * batch_id;
+    if (kv_ceiling == 0) {
+        // no visible key for any row in this block: zero the output and return
+        const int n4 = valid_q_rows * (D / 4);
+        for (int i = tid; i < n4; i += CFG::THREADS_PER_BLOCK) {
+            const int row = i / (D / 4);
+            const int col = (i - row * (D / 4)) * 4;
+            *reinterpret_cast<float4 *>(d_base
+                + (int64_t) (start_row + row) * stride_D2
+                + (int64_t) q_head_id * stride_D1
+                + (int64_t) col * sizeof(float)) = make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        return;
+    }
 
     extern __shared__ char smem_raw[];
     init_smem_v100<CFG>(smem_raw);
@@ -656,6 +715,7 @@ bool ggml_cuda_flash_attn_ext_v100_available(const ggml_tensor * dst) {
 
 template <typename CFG>
 static void ggml_cuda_flash_attn_ext_v100_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    using namespace ggml_cuda_fattn_v100; // launch syntax needs the bare kernel name
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
@@ -688,6 +748,21 @@ static void ggml_cuda_flash_attn_ext_v100_launch(ggml_backend_cuda_context & ctx
 
     cudaStream_t main_stream = ctx.stream();
 
+    // Per-row visibility ceiling from the mask (causal/SWA KV skip). Runs inside
+    // the capture region, so the buffer is allocated from the context pool here
+    // (before capture starts).
+    ggml_cuda_pool_alloc<int> kv_max_buf(ctx.pool());
+    int * kv_max_ptr = nullptr;
+    if (mask != nullptr) {
+        kv_max_buf.alloc(M);
+        kv_max_ptr = kv_max_buf.ptr;
+        const dim3 kv_blocks(M, 1, 1);
+        const dim3 kv_threads(256, 1, 1);
+        fattn_v100_mask_kvmax_kernel<<<kv_blocks, kv_threads, 0, main_stream>>>(
+            (const half *) mask->data, kv_max_ptr, N, M, (int64_t) mask->nb[1]);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     const dim3 block_dim(CFG::THREADS_PER_BLOCK, 1, 1);
     const dim3 blocks_num((M + CFG::BLOCK_M - 1) / CFG::BLOCK_M, 1, H);
 
@@ -703,6 +778,7 @@ static void ggml_cuda_flash_attn_ext_v100_launch(ggml_backend_cuda_context & ctx
         (const char *) K->data,
         (const char *) V->data,
         (const char *) mask->data,
+        kv_max_ptr,
         sinks ? (const float *) sinks->data : nullptr,
         (char *) dst->data,
         M, N, H, H_KV,
