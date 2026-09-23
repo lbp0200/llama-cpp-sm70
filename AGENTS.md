@@ -51,13 +51,20 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
 - **Final target model on the 2070: `translategemma-4b-it.i1-Q4_K_M.gguf`**
   (~2.5 GB, `~/models/` on the box, also mirrored under `~/Models/` on the dev
   Mac). It is the reference for all SM75 A/B: head_dim 256, GQA 2, f16 KV
-  friendly, and it exercises the Volta FA kernel gate
-  (`GGML_V100_FA`, cc == 700 || cc == 750 WIP).
+  friendly, and it exercises the Volta FA kernel gate (`GGML_V100_FA`,
+  cc == 700 || cc == 750, both supported since 06837a189).
 - Build on the box: `cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75`.
 - The V100 box (192.168.7.3, sm_70, 32 GB) stays the large-model/long-context
   validation environment (Qwen3.8-27B IQ4_XS etc.).
 - Volta/SM75 FA work lives on branch `feature/v100-fa-port`
   (`ggml-cuda/fattn-v100.cuh` + the graph null-deref fix).
+- **SM75 gotcha (cost a full debug session): the 1Cat WMMA fragment ->
+  (row, col) expansion only holds for Volta (HMMA.884). Turing (HMMA.16816)
+  has a different fragment element order, so mask/scale applied through the
+  fragment lands on wrong positions. The kernel now applies scale + mask on
+  the smem tile by explicit (row, col) after `store_matrix_sync`, which is
+  architecture independent. Never trust a fixed fragment expansion across
+  archs; verify with a single-warp probe (`probe4.cu`) if in doubt.
 
 ### SM75 optimization reference (vLLM-2080Ti-Definitive)
 
