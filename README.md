@@ -40,10 +40,11 @@ Target hardware and what it is used for:
   `translategemma-4b` (`head_dim` 256, GQA 2).
 
 Correctness is gated by `test-backend-ops` (`FLASH_ATTN_EXT` 470/470 for
-`hsk=256` and 7764/7764 for `hsk` 64..640) and by real-model A/B runs. The
-Turing results are validated on the RTX 2070; the Volta path uses the same
-kernels and gates but still needs a re-run on the V100 after the Turing
-fragment fix. Build, test and commit conventions live in [AGENTS.md](AGENTS.md).
+`hsk=256`, full sweep 7747/7747 on the V100 excluding the known `hsk=320`
+permute defect, 7764/7764 on the RTX 2070) and by real-model A/B runs. The
+latest V100 regression run passed after the Turing fragment fix; the RTX 2070
+shares the same kernels and gates. Build, test and commit conventions live in
+[AGENTS.md](AGENTS.md).
 
 ## Quick start
 
