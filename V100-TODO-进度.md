@@ -289,9 +289,21 @@ GGML_V100_FA=0    # 立即回到旧路径
    `fb7ee08b3` 回滚到已验证内核**。合入态 = 门禁全绿的 HEAD 内核（4x470 + 7747 + 冒烟）。
 2. 任务合同的 pp65536>=330 未达成（HEAD 自身 288.9，需要在 HEAD 基础上 +14% 才达标）；
    本夜证伪了所有预设杠杆（见上表），**旧路径 1.6x 的真因仍未定位**。
-3. 遗留假说（下一步）：旧 mma 的 `nbatch_fa` 分段细粒度 CTA（grid >> 输出 tile 数、seam fixup
-   组合部分和）+ `nstages>1` cp.async 多级流水 —— 需读 `get_nbatch_fa/get_nstages` 的 D=256 取值
-   并做等价移植评估；或在上游 issue #28037 语境下与维护者对齐优化路线。
+3. 遗留假说修正（已读 `fattn-mma-f16.cuh` 配置表，一实一伪）：
+   - **Volta 对 (256,256,64) 无专属配置**（`get_config_volta` 只特判 D=512/576/640，
+     其余 `// TODO tune specifically for Volta` 落回 ampere 表）：
+     `nthreads=512, occupancy=1, nbatch_fa=64, nbatch_K2=128, nbatch_V2=128,
+     nbatch_combine=64, nstages_target=1, Q_in_reg=true`
+   - **伪**：cp.async 多级流水 —— `nstages_target=1`（定义注释：1 == 永远同步加载）
+     ⇒ 旧路径 D=256 并不流水化，我们的串行加载不是差距来源。
+   - **实（精化）**：`nbatch_fa=64` ⇒ `iter_k = ceil(N/64)`，旧路径 grid 是
+     **(N/64) x (M/32) x (gqa/2) x H_KV ≈ 20 万个细粒度 CTA**（seam fixup 组合部分和），
+     每 CTA 只碰 64 个 KV 位置（工作集极小、延迟靠 CTA 级并行隐藏），而我们是
+     192 个 CTA 各自扫全 N。外加 `Q_in_reg=true`（Q 常驻寄存器，零 smem Q 流量，
+     我们每 k-tile 都从 smem 载入 Q fragment）。
+   - **下一步方向**：把 v1 内核改为 nbatch_fa 分段 CTA（块内只扫64列 + 部分和 fixup）
+     或等价的 KV 分段 grid 重构；Q_in_reg 次之。或在上游 issue #28037 语境下
+     与维护者对齐优化路线。
 
 ## 下一步 TODO（按优先级）
 
