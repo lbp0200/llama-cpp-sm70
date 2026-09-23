@@ -57,7 +57,7 @@ struct cfg {
     static constexpr int WARPS_PER_BLOCK = THREADS_PER_BLOCK / 32;
     // THREADS_PER_ROW = THREADS_PER_BLOCK / BLOCK_M: 512/32 = 16 and 256/16 = 16.
     static constexpr int THREADS_PER_ROW = THREADS_PER_BLOCK / BLOCK_M;
-    static constexpr int P_SUB_TILE = 32; // softmax sub-tile width (also a KV tile bound)
+    static constexpr int P_SUB_TILE = 64; // softmax sub-tile = full BN (one pass per tile)
 
     static constexpr int D256_PAD = 0; // (8 - (256 % 32) + 32) % 32
 
@@ -224,7 +224,8 @@ flash_attn_ext_v100_kernel(
     }
     const int tid = threadIdx.x;
 
-    const int batch_head_id = blockIdx.z;
+    const int batch_head_id = blockIdx.x; // head-major launch order: the gqa
+                                          // group shares K in L2
     if (false && debug) {
         return; // DEBUG probe disabled
     }
@@ -243,7 +244,7 @@ flash_attn_ext_v100_kernel(
     }
     const int kv_head_id = q_head_id / kv_group_size;
 
-    const int start_row = blockIdx.x * CFG::BLOCK_M;
+    const int start_row = blockIdx.y * CFG::BLOCK_M;
     if (start_row >= M) {
         return;
     }
@@ -770,7 +771,7 @@ static void ggml_cuda_flash_attn_ext_v100_launch(ggml_backend_cuda_context & ctx
     }
 
     const dim3 block_dim(CFG::THREADS_PER_BLOCK, 1, 1);
-    const dim3 blocks_num((M + CFG::BLOCK_M - 1) / CFG::BLOCK_M, 1, H);
+    const dim3 blocks_num(H, (M + CFG::BLOCK_M - 1) / CFG::BLOCK_M, 1);
 
     static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
     if (!shared_memory_limit_raised[id]) {
