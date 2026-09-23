@@ -18,8 +18,10 @@
 // - Env kill-switch: GGML_V100_FA=0 falls back to the existing kernels.
 //
 // Two configs:
-// - cfg_v100: BLOCK_M=32 / BLOCK_N=64 / 512 threads (16 warps), ~92KB smem.
-//   Volta/GV100 has 96KB smem per block, so it needs the raised limit.
+// - cfg_v100: BLOCK_M=64 / BLOCK_N=32 / 512 threads (16 warps), ~77KB smem.
+//   BLOCK_M=64 halves the KV streams per KV head (matches the old mma GQA x2
+//   pack: M/64 x H == M/32 x H/2). A 64-row fp32 O tile is 64KB, so O stays
+//   in registers (REGS_O) and round-trips through a band-quarter scratch.
 // - cfg_sm75: BLOCK_M=16 / BLOCK_N=64 / 256 threads (8 warps), ~61KB smem.
 //   Turing has 64KB smem per block and no cp.async either; the narrow M tile
 //   keeps the same layout logic with double the blocks for the same work.
@@ -49,13 +51,26 @@ static constexpr int WMMA_M = 16;
 static constexpr int WMMA_N = 16;
 static constexpr int WMMA_K = 16;
 
-template <int BLOCK_M_, int BLOCK_N_, int THREADS_PER_BLOCK_>
+// O storage: smem tile (legacy) or band-quarter scratch (REGS_O).
+template <int BM_, bool REGS_O_, int NT_>
+struct ORegion;
+template <int BM_, int NT_>
+struct ORegion<BM_, true, NT_> {
+    alignas(16) float os[(NT_ / 32) * WMMA_M * WMMA_M]; // one 16x16 slot per warp
+};
+template <int BM_, int NT_>
+struct ORegion<BM_, false, NT_> {
+    alignas(16) float o[BM_ * 256];
+};
+
+template <int BLOCK_M_, int BLOCK_N_, int THREADS_PER_BLOCK_, bool REGS_O_>
 struct cfg {
     static constexpr int BLOCK_M = BLOCK_M_;
     static constexpr int BLOCK_N = BLOCK_N_;
     static constexpr int THREADS_PER_BLOCK = THREADS_PER_BLOCK_;
+    static constexpr bool REGS_O = REGS_O_;
     static constexpr int WARPS_PER_BLOCK = THREADS_PER_BLOCK / 32;
-    // THREADS_PER_ROW = THREADS_PER_BLOCK / BLOCK_M: 512/32 = 16 and 256/16 = 16.
+    // THREADS_PER_ROW = THREADS_PER_BLOCK / BLOCK_M: 512/64 = 8, 256/16 = 16.
     static constexpr int THREADS_PER_ROW = THREADS_PER_BLOCK / BLOCK_M;
     static constexpr int P_SUB_TILE = 32; // softmax sub-tile width (also a KV tile bound)
 
@@ -71,13 +86,16 @@ struct cfg {
 
     struct alignas(128) SmemLayout {
         alignas(16) half  q[BLOCK_M * Q_STRIDE];
-        union {
+        // split K/V (no union): lets K(i+1) prefetch overlap mask/softmax/PV
+        // and V(i+1) prefetch overlap the next tile's QK/mask/softmax
+        struct {
             alignas(16) half k[BLOCK_N * KV_STRIDE];
             alignas(16) half v[BLOCK_N * KV_STRIDE];
         } kv;
         alignas(16) float s[BLOCK_M * S_STRIDE];
         alignas(16) half  p[BLOCK_M * P_STRIDE];
-        alignas(16) float o[BLOCK_M * O_STRIDE];
+        ORegion<BLOCK_M, REGS_O, THREADS_PER_BLOCK> oreg;
+        alignas(16) float expd[BLOCK_M];
         alignas(16) float row_max[BLOCK_M];
         alignas(16) float row_sum[BLOCK_M];
     };
@@ -86,8 +104,8 @@ struct cfg {
 };
 
 // V100 (GV100, 96KB smem/block) and SM75 (TU116/TU106, 64KB smem/block) configs.
-using cfg_v100 = cfg<32, 64, 512>;
-using cfg_sm75 = cfg<16, 64, 256>;
+using cfg_v100 = cfg<64, 32, 512, true>;
+using cfg_sm75 = cfg<16, 64, 256, false>;
 
 template <typename CFG>
 __device__ __forceinline__ void init_smem_v100(char * smem_raw) {
@@ -187,6 +205,33 @@ __global__ static void fattn_v100_mask_kvmax_kernel(
             c = max(c, red[w]);
         }
         kv_max[row] = c >= 0 ? c + 1 : 0;
+    }
+}
+
+// REGS_O: apply this softmax step's exp_diff to the warp's resident O
+// fragments. Each warp round-trips its fragments one by one through its own
+// 16x16 scratch slot: no cross-warp state, so no barriers at all. sExpd is
+// written before the syncthreads that precedes this call.
+template <typename CFG, int N_FRAG>
+__device__ __forceinline__ void regs_o_rescale(
+        fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> (&o_frag)[N_FRAG],
+        float * __restrict__ sOS, const float * __restrict__ sExpd) {
+    constexpr int O_TILES_D = 256 / WMMA_N;
+    constexpr int TPV = ((CFG::BLOCK_M / WMMA_M) * O_TILES_D + CFG::WARPS_PER_BLOCK - 1) / CFG::WARPS_PER_BLOCK;
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x - warp_id * 32;
+    float * scr = sOS + warp_id * (WMMA_M * WMMA_M);
+#pragma unroll
+    for (int t = 0; t < N_FRAG; ++t) {
+        const int tm = (warp_id * TPV + t) / O_TILES_D;
+        store_matrix_sync(scr, o_frag[t], WMMA_M, mem_row_major);
+        for (int i = lane; i < WMMA_M * WMMA_M; i += 32) {
+            const float f = sExpd[tm * WMMA_M + i / WMMA_M];
+            if (f != 1.0f) {
+                scr[i] *= f;
+            }
+        }
+        load_matrix_sync(o_frag[t], scr, WMMA_M, mem_row_major);
     }
 }
 
@@ -307,12 +352,34 @@ flash_attn_ext_v100_kernel(
     half  * sV = smem.kv.v;
     float * sS = smem.s;
     half  * sP = smem.p;
-    float * sO = smem.o;
+    float * sO = nullptr;
+    if constexpr (!CFG::REGS_O) {
+        sO = smem.oreg.o;
+    }
+    float * sOS = nullptr;
+    if constexpr (CFG::REGS_O) {
+        sOS = smem.oreg.os;
+    }
+    float * sExpd  = smem.expd;
     float * sRowMax = smem.row_max;
     float * sRowSum = smem.row_sum;
 
     if (threadIdx.x < CFG::BLOCK_M) {
         sRowMax[threadIdx.x] = CFG::NEG_INF;
+        sExpd[threadIdx.x] = 1.0f;
+    }
+
+    // REGS_O: per-warp O accumulator tiles, resident across the whole KV loop.
+    constexpr int O_TILES_M = CFG::BLOCK_M / WMMA_M;
+    constexpr int O_TILES_D = 256 / WMMA_N;
+    constexpr int O_TILES_TOTAL = O_TILES_M * O_TILES_D;
+    constexpr int O_TILES_PER_WARP = (O_TILES_TOTAL + CFG::WARPS_PER_BLOCK - 1) / CFG::WARPS_PER_BLOCK;
+    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> o_frag[O_TILES_PER_WARP];
+    if constexpr (CFG::REGS_O) {
+#pragma unroll
+        for (int t = 0; t < O_TILES_PER_WARP; ++t) {
+            fill_fragment(o_frag[t], 0.0f);
+        }
     }
 
     load_q_f32_to_smem<CFG>(q_base + (int64_t) start_row * stride_Q1, stride_Q1, sQ, valid_q_rows);
@@ -322,8 +389,10 @@ flash_attn_ext_v100_kernel(
         const int start_col = block_n * CFG::BLOCK_N;
         const int valid_k_rows = min(CFG::BLOCK_N, N - start_col);
 
-        // QK: load K tile, warps x m16n16k16 over D, store fp32 scores to smem.
+        // QK: load K tile then compute (loads compete with the softmax/MV
+        // bandwidth if prefetched early, so keep them close to their use).
         load_kv_f16_to_smem<CFG>(k_base + (int64_t) start_col * stride_K1, stride_K1, sK, valid_k_rows);
+        load_kv_f16_to_smem<CFG>(v_base + (int64_t) start_col * stride_V1, stride_V1, sV, valid_k_rows);
         __syncthreads();
 
         const int num_tiles_m_qk = (CFG::BLOCK_M + WMMA_M - 1) / WMMA_M;
@@ -346,7 +415,18 @@ flash_attn_ext_v100_kernel(
             const int tile_n_idx = global_tile_idx - tile_m_idx * num_tiles_n_qk;
             const int tile_m = tile_m_idx * WMMA_M;
             const int tile_n = tile_n_idx * WMMA_N;
-            if (tile_m >= valid_q_rows || tile_n >= valid_k_rows) {
+            if (tile_m >= valid_q_rows) {
+                continue;
+            }
+            if (tile_n >= valid_k_rows) {
+                // poisoned tail columns: no scores exist, store -inf directly
+                for (int idx = lane_id; idx < WMMA_M * WMMA_N; idx += 32) {
+                    const int r = tile_m + idx / WMMA_N;
+                    const int c = tile_n + idx - (r - tile_m) * WMMA_N;
+                    if (r < valid_q_rows) {
+                        sS[r * CFG::S_STRIDE + c] = CFG::NEG_INF;
+                    }
+                }
                 continue;
             }
 
@@ -372,25 +452,17 @@ flash_attn_ext_v100_kernel(
             // differs between Volta (HMMA.884) and Turing (HMMA.16816), so a
             // fixed acc_frag.x[i] -> (row, col) expansion is not portable.
             store_matrix_sync(sS + tile_m * CFG::S_STRIDE + tile_n, acc_frag, CFG::S_STRIDE, mem_row_major);
+
+            // scale + mask on this tile's own cells (warp-local, no barrier)
+            for (int idx = lane_id; idx < WMMA_M * WMMA_N; idx += 32) {
+                const int r = tile_m + idx / WMMA_N;
+                const int c = tile_n + idx - (r - tile_m) * WMMA_N;
+                const half mv = __ldg(reinterpret_cast<const half *>(m_base + (int64_t) (start_row + r) * stride_M1) + start_col + c);
+                sS[r * CFG::S_STRIDE + c] = sS[r * CFG::S_STRIDE + c] * scale + __half2float(mv);
+            }
         }
         __syncthreads();
 
-        // Scale + mask by explicit (row, col), architecture independent.
-        for (int i = tid; i < valid_q_rows * CFG::BLOCK_N; i += CFG::THREADS_PER_BLOCK) {
-            const int row = i / CFG::BLOCK_N;
-            const int col = i - row * CFG::BLOCK_N;
-            const int global_m = start_row + row;
-            const int global_n = start_col + col;
-            float v;
-            if (global_n < start_col + valid_k_rows) {
-                const half mask_val = __ldg(reinterpret_cast<const half *>(m_base + (int64_t) global_m * stride_M1) + global_n);
-                v = sS[row * CFG::S_STRIDE + col] * scale + __half2float(mask_val);
-            } else {
-                v = CFG::NEG_INF;
-            }
-            sS[row * CFG::S_STRIDE + col] = v;
-        }
-        __syncthreads();
         if (debug_out != nullptr && debug && threadIdx.x == 0 && blockIdx.z == 1 && blockIdx.x == 0) {
             {
                 int v0 = 0, v1 = 0;
@@ -406,14 +478,12 @@ flash_attn_ext_v100_kernel(
                 debug_out[5] = (float) M;
                 debug_out[6] = (float) start_row;
                 debug_out[7] = (float) valid_q_rows;
+
                 for (int cc = 0; cc < 4; ++cc) {
                     debug_out[96 + cc] = __half2float(__ldg(reinterpret_cast<const half *>(m_base + (int64_t) 0 * stride_M1) + cc)); // direct mask[0][cc]
                 }
             }
         }
-        // PV: load V into the K/V union slot, sub-tile softmax, WMMA PV.
-        load_kv_f16_to_smem<CFG>(v_base + (int64_t) start_col * stride_V1, stride_V1, sV, valid_k_rows);
-        __syncthreads();
 
         const int num_tiles_m_pv = (CFG::BLOCK_M + WMMA_M - 1) / WMMA_M;
         const int num_tiles_d_pv = (D + WMMA_N - 1) / WMMA_N;
@@ -503,6 +573,7 @@ flash_attn_ext_v100_kernel(
                 if (thread_in_row == 0) {
                     sRowSum[row] = exp_diff * sRowSum[row] + row_sum;
                     sRowMax[row] = new_max;
+                    sExpd[row] = exp_diff;
                 }
 
                 h2_idx = 0;
@@ -526,18 +597,20 @@ flash_attn_ext_v100_kernel(
                     }
                 }
 
-                if (block_n > 0 || sub_start > 0) {
-                    float * sO_row = sO + row * CFG::O_STRIDE;
-                    float4 * sO_vec = reinterpret_cast<float4 *>(sO_row);
-                    const int o_vec_count = (CFG::O_STRIDE + 3) >> 2;
+                if constexpr (!CFG::REGS_O) {
+                    if (block_n > 0 || sub_start > 0) {
+                        float * sO_row = sO + row * CFG::O_STRIDE;
+                        float4 * sO_vec = reinterpret_cast<float4 *>(sO_row);
+                        const int o_vec_count = (CFG::O_STRIDE + 3) >> 2;
 #pragma unroll 4
-                    for (int ov = thread_in_row; ov < o_vec_count; ov += CFG::THREADS_PER_ROW) {
-                        float4 v = sO_vec[ov];
-                        v.x *= exp_diff;
-                        v.y *= exp_diff;
-                        v.z *= exp_diff;
-                        v.w *= exp_diff;
-                        sO_vec[ov] = v;
+                        for (int ov = thread_in_row; ov < o_vec_count; ov += CFG::THREADS_PER_ROW) {
+                            float4 v = sO_vec[ov];
+                            v.x *= exp_diff;
+                            v.y *= exp_diff;
+                            v.z *= exp_diff;
+                            v.w *= exp_diff;
+                            sO_vec[ov] = v;
+                        }
                     }
                 }
             }
@@ -548,6 +621,11 @@ flash_attn_ext_v100_kernel(
                 }
                 debug_out[48] = sRowMax[0];
                 debug_out[49] = sRowSum[0];
+            }
+            if constexpr (CFG::REGS_O) {
+                if (block_n > 0 || sub_start > 0) {
+                    regs_o_rescale<CFG>(o_frag, sOS, sExpd);
+                }
             }
             const int num_tiles_k_pv = (p_tile_capacity + WMMA_K - 1) / WMMA_K;
 
@@ -567,21 +645,33 @@ flash_attn_ext_v100_kernel(
 
                 fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> a_frag;
                 fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, row_major> b_frag;
-                fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
 
-                load_matrix_sync(acc_frag, sO + tile_m * CFG::O_STRIDE + tile_d, CFG::O_STRIDE, mem_row_major);
-
+                if constexpr (!CFG::REGS_O) {
+                    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
+                    load_matrix_sync(acc_frag, sO + tile_m * CFG::O_STRIDE + tile_d, CFG::O_STRIDE, mem_row_major);
 #pragma unroll
-                for (int tile_k = 0; tile_k < num_tiles_k_pv; ++tile_k) {
-                    const int k_off = tile_k * WMMA_K;
-                    if (k_off >= sub_valid_k_rows) {
-                        break;
+                    for (int tile_k = 0; tile_k < num_tiles_k_pv; ++tile_k) {
+                        const int k_off = tile_k * WMMA_K;
+                        if (k_off >= sub_valid_k_rows) {
+                            break;
+                        }
+                        load_matrix_sync(a_frag, sP + tile_m * CFG::P_STRIDE + k_off, CFG::P_STRIDE);
+                        load_matrix_sync(b_frag, sV + (sub_start + k_off) * CFG::KV_STRIDE + tile_d, CFG::KV_STRIDE);
+                        mma_sync(acc_frag, a_frag, b_frag, acc_frag);
                     }
-                    load_matrix_sync(a_frag, sP + tile_m * CFG::P_STRIDE + k_off, CFG::P_STRIDE);
-                    load_matrix_sync(b_frag, sV + (sub_start + k_off) * CFG::KV_STRIDE + tile_d, CFG::KV_STRIDE);
-                    mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+                    store_matrix_sync(sO + tile_m * CFG::O_STRIDE + tile_d, acc_frag, CFG::O_STRIDE, mem_row_major);
+                } else {
+#pragma unroll
+                    for (int tile_k = 0; tile_k < num_tiles_k_pv; ++tile_k) {
+                        const int k_off = tile_k * WMMA_K;
+                        if (k_off >= sub_valid_k_rows) {
+                            break;
+                        }
+                        load_matrix_sync(a_frag, sP + tile_m * CFG::P_STRIDE + k_off, CFG::P_STRIDE);
+                        load_matrix_sync(b_frag, sV + (sub_start + k_off) * CFG::KV_STRIDE + tile_d, CFG::KV_STRIDE);
+                        mma_sync(o_frag[tile_idx], a_frag, b_frag, o_frag[tile_idx]);
+                    }
                 }
-                store_matrix_sync(sO + tile_m * CFG::O_STRIDE + tile_d, acc_frag, CFG::O_STRIDE, mem_row_major);
             }
             __syncthreads();
         }
@@ -597,17 +687,24 @@ flash_attn_ext_v100_kernel(
             const float exp_diff = expf(old_max - new_max);
             sRowSum[row] = exp_diff * sRowSum[row] + expf(sink - new_max);
             sRowMax[row] = new_max;
-            float * sO_row = sO + row * CFG::O_STRIDE;
-            for (int i = 0; i < CFG::O_STRIDE / 4; ++i) {
-                float4 v = reinterpret_cast<float4 *>(sO_row)[i];
-                v.x *= exp_diff;
-                v.y *= exp_diff;
-                v.z *= exp_diff;
-                v.w *= exp_diff;
-                reinterpret_cast<float4 *>(sO_row)[i] = v;
+            if constexpr (CFG::REGS_O) {
+                sExpd[row] = exp_diff;
+            } else {
+                float * sO_row = sO + row * CFG::O_STRIDE;
+                for (int i = 0; i < CFG::O_STRIDE / 4; ++i) {
+                    float4 v = reinterpret_cast<float4 *>(sO_row)[i];
+                    v.x *= exp_diff;
+                    v.y *= exp_diff;
+                    v.z *= exp_diff;
+                    v.w *= exp_diff;
+                    reinterpret_cast<float4 *>(sO_row)[i] = v;
+                }
             }
         }
         __syncthreads();
+        if constexpr (CFG::REGS_O) {
+            regs_o_rescale<CFG>(o_frag, sOS, sExpd);
+        }
     }
 
     // Normalize O by the running row sum and store fp32 output rows.
@@ -615,9 +712,45 @@ flash_attn_ext_v100_kernel(
         debug_out[50] = sRowMax[0];
         debug_out[51] = sRowSum[0];
         for (int c = 0; c < 8; ++c) {
-            debug_out[52 + c] = sO[c];
+            debug_out[52 + c] = sO != nullptr ? sO[c] : (sOS != nullptr ? sOS[c] : 0.0f);
         }
     }
+    if constexpr (CFG::REGS_O) {
+        // Each warp normalizes its fragments through its private scratch slot
+        // and writes its dst cells directly: no shared state, no barriers.
+        const int warp_id_f = tid / 32;
+        const int first_tile = warp_id_f * O_TILES_PER_WARP;
+        float * scr = sOS + warp_id_f * (WMMA_M * WMMA_M);
+#pragma unroll
+        for (int t = 0; t < O_TILES_PER_WARP; ++t) {
+            const int g = first_tile + t;
+            const int tm = g / O_TILES_D;
+            const int td = g - tm * O_TILES_D;
+            store_matrix_sync(scr, o_frag[t], WMMA_M, mem_row_major);
+            for (int i = tid % 32; i < WMMA_M * WMMA_M; i += 32) {
+                const int rloc = i / WMMA_M;
+                const int row = tm * WMMA_M + rloc;
+                if (row < valid_q_rows) {
+                    const int cloc = i - rloc * WMMA_M;
+                    const int col = td * WMMA_N + cloc;
+                    const float inv_sum = 1.0f / fmaxf(sRowSum[row], 1e-24f);
+                    *reinterpret_cast<float *>(
+                        d_base + (int64_t) (start_row + row) * stride_D2 + (int64_t) q_head_id * stride_D1 + (int64_t) col * sizeof(float)) =
+                        scr[i] * inv_sum;
+                }
+            }
+        }
+        if (debug_out != nullptr && debug && threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.z == 0) {
+            debug_out[108] = sRowSum[0];
+            debug_out[109] = sRowSum[1];
+            debug_out[126] = sExpd[0];
+            debug_out[127] = sExpd[1];
+            for (int c = 0; c < 8; ++c) {
+                debug_out[100 + c] = 0.0f;
+                debug_out[110 + c] = 0.0f;
+            }
+        }
+    } else {
     const int total_f32x4 = valid_q_rows * (D / 4);
     for (int i = tid; i < total_f32x4; i += CFG::THREADS_PER_BLOCK) {
         const int row = i / (D / 4);
@@ -651,6 +784,7 @@ flash_attn_ext_v100_kernel(
             debug_out[93] = back.w;
             debug_out[94] = (float) (uintptr_t) (d_base - dst_ptr);
         }
+    }
     }
     __syncthreads();
 
@@ -818,20 +952,31 @@ static void ggml_cuda_flash_attn_ext_v100_launch(ggml_backend_cuda_context & ctx
         fprintf(stderr, "\n[V100-DUMP] kernel wrote out: ");
         for (int i = 70; i < 74; ++i) fprintf(stderr, "%.3f ", hbuf[i]);
         fprintf(stderr, "| sum=%.3f sD1=%.0f sD2=%.0f\n", hbuf[74], hbuf[75], hbuf[76]);
-        float drb[8] = {0};
-        CUDA_CHECK(cudaMemcpyAsync(drb, dst->data, sizeof(float) * 8,
+        float drb[65544] = {0};
+        CUDA_CHECK(cudaMemcpyAsync(drb, dst->data, sizeof(float) * 65544,
             cudaMemcpyDeviceToHost, main_stream));
         CUDA_CHECK(cudaStreamSynchronize(main_stream));
-        fprintf(stderr, "[V100-DUMP] dst[0..7] readback: ");
-        for (int i = 0; i < 8; ++i) fprintf(stderr, "%.3f ", drb[i]);
+        fprintf(stderr, "[V100-DUMP] dst r0: ");
+        for (int i = 0; i < 8; ++i) fprintf(stderr, "%.4f ", drb[i]);
+        fprintf(stderr, "| tok1h0x16:");
+        for (int i = 4096; i < 4112; ++i) fprintf(stderr, "%.4f ", drb[i]);
+        fprintf(stderr, "| tok16h0:");
+        for (int i = 65536; i < 65544; ++i) fprintf(stderr, "%.4f ", drb[i]);
         fprintf(stderr, "\n[V100-DUMP] kernel readback same addr: ");
         for (int i = 90; i < 94; ++i) fprintf(stderr, "%.3f ", hbuf[i]);
         fprintf(stderr, "| d_base offset=%.0f\n", hbuf[94]);
         fprintf(stderr, "[V100-DUMP] visible-cols r0=%d r1=%d sS00=%.2f sS0_16=%.2f N=%.0f M=%.0f valid_q_rows=%.0f\n",
             (int) hbuf[0], (int) hbuf[1], hbuf[2], hbuf[3], hbuf[4], hbuf[5], hbuf[6], hbuf[7]);
+        fprintf(stderr, "[V100-DUMP] O_r0[0..7]=" );
+        for (int i = 100; i < 108; ++i) fprintf(stderr, "%.4f ", hbuf[i]);
+        fprintf(stderr, "\n[V100-DUMP] O_r1x16=");
+        for (int i = 110; i < 126; ++i) fprintf(stderr, "%.4f ", hbuf[i]);
+        fprintf(stderr, "| sum r0=%.3f r1=%.3f\n", hbuf[108], hbuf[109]);
+        fprintf(stderr, "[V100-DUMP] expd r0=%.5f r1=%.5f\n", hbuf[126], hbuf[127]);
         fprintf(stderr, "[V100-DUMP] QK-maskhit gm=%.0f gn=%.0f acc=%.2f mask[0][0..3]: ",
             hbuf[20], hbuf[21], hbuf[22]);
         for (int i = 30; i < 34; ++i) fprintf(stderr, "%.2f ", hbuf[i]);
+
         fprintf(stderr, "| direct mask[0][0..3]: ");
         for (int i = 96; i < 100; ++i) fprintf(stderr, "%.2f ", hbuf[i]);
         fprintf(stderr, "\n");
