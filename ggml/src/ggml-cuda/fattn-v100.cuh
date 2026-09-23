@@ -20,8 +20,8 @@
 // Two configs:
 // - cfg_v100: BLOCK_M=32 / BLOCK_N=64 / 512 threads (16 warps), ~92KB smem.
 //   Volta/GV100 has 96KB smem per block, so it needs the raised limit.
-// - cfg_sm75: BLOCK_M=16 / BLOCK_N=32 / 256 threads (8 warps), ~43KB smem.
-//   Turing has 64KB smem per block and no cp.async either; the narrow tile
+// - cfg_sm75: BLOCK_M=16 / BLOCK_N=64 / 256 threads (8 warps), ~61KB smem.
+//   Turing has 64KB smem per block and no cp.async either; the narrow M tile
 //   keeps the same layout logic with double the blocks for the same work.
 
 #include "common.cuh"
@@ -87,7 +87,7 @@ struct cfg {
 
 // V100 (GV100, 96KB smem/block) and SM75 (TU116/TU106, 64KB smem/block) configs.
 using cfg_v100 = cfg<32, 64, 512>;
-using cfg_sm75 = cfg<16, 32, 256>;
+using cfg_sm75 = cfg<16, 64, 256>;
 
 template <typename CFG>
 __device__ __forceinline__ void init_smem_v100(char * smem_raw) {
@@ -836,7 +836,7 @@ static void ggml_cuda_flash_attn_ext_v100(ggml_backend_cuda_context & ctx, ggml_
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (cc == GGML_CUDA_CC_TURING) {
         using namespace ggml_cuda_fattn_v100;
-        ggml_cuda_flash_attn_ext_v100_launch<ggml_cuda_fattn_v100::cfg<16, 64, 256>>(ctx, dst); // EXP BN=64
+        ggml_cuda_flash_attn_ext_v100_launch<cfg_sm75>(ctx, dst);
     } else {
         using namespace ggml_cuda_fattn_v100;
         ggml_cuda_flash_attn_ext_v100_launch<cfg_v100>(ctx, dst);
