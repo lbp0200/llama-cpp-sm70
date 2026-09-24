@@ -538,6 +538,31 @@ mma/ldmatrix PTX 本身按硬件 lane 工作，任意 blockDim 无碍 —— 只
   `if constexpr (CFG::MMA)` 双分支；solo/v100 编译路径字节不变
 - 验收：470/470 x2 + sweep + smoke；pp4096 2732 -> >=2900（旧 3054），tg 108 不动
 
+### 路线 B 引擎首版调试纪要（2026-09-24，未过门禁未入库——代码已还原，结论全录）
+
+**已实证的两个硬发现：**
+1. **`mma.cuh::load_ldmatrix(_trans)` 同 get_i/get_j 一样硬编码裸 `threadIdx.x`**
+   （`(tid/16)*(J/2)` 列偏移）——上游块宽恒 32，我们 256 线程下**除 warp0 全部错列**。
+   lane 版 wrapper（asm 逐字拷贝、 threadIdx.x&31）落地后：失败用例 ERR **0.996 -> 0.563**
+   （已写入本文件工作区版本，还原前记录：`ldm16x8_lane` / `ldm16x8_lane_trans`，注意
+   trans 版输出寄存器序 `{0,2,1,3}` 交换必须保留）。probe5 单 warp 测不出此 bug。
+2. **probe6（跨 warp 行协议隔离器，本库已入库）四轮定界**：
+   - row **max 路径 32/32 全对**（scratch_max/xors/发布结构 ✓，探针即证明）
+   - **row sum 32/32 全错**，但逐 tile 发布链算术自洽（ef*old+tot 逐步可复核 ✓）
+   - 槽位值两行四列完全相同被证实为 mod19 周期巧合（行位移 17 + 列位移 2 ≡ 0），非串写
+   - **真凶线索：t0 的槽位含 exp=1 的命中列（1.0117 ✓），t1/t2 的槽位系统性丢失
+     sn 附近的大 exp 项（sub1 仅 0.0523 ≈ 只剩 ≤sn-3 的小项）** —— 即 tiles>0 的
+     exp/sum 支路把接近行最大值的贡献弄丢。下一步从 S[l] 覆写时序 / exp 与 rescale 的
+     寄存器别名 / sum 初值化三处下手（t0 vs t1+ 的唯一代码差异：block_n>0 分支与
+     ef*old 激活）。
+- 门禁实况：首版引擎 468/470（仅两例 gqa=6 大 kv 用例挂，恰是全库仅有的 pair_mma
+  覆盖用例）；MMA=0 回退 470/470 ✓；真模型冒烟空输出。失败样例参数：
+  `hsk=256 nh=4 nr23={6,1} kv=4096/16384 nb=512 mask=1`（gqa=6, M=512）
+- 引擎实现的关键正确部分已验证可复用：warp 映射、mask 直入寄存器、跨 warp 归约骨架、
+  分相 dst 散射、launch_bounds(256,1)、ORegion 三态、cfg MMA 旗标与 SmemLayout 收缩
+- probe6 的价值：纯协议、块级 (32 lanes x 8 warps)、合成分数、CPU 全对照 —— 下次
+  继续调试**必须先让 probe6 转绿**再动内核（原子(probe5)与协议(probe6)双绿后合并进内核）
+
 **备选（若只要数字）**：pair 形状派发级转调上游 mma 内核（20 行，pp4096 立得 ~3054），
 代价=pair wmma 引擎变成无人执行的死代码、门禁不再覆盖它 -> 不推荐，除非用户明示。
 
