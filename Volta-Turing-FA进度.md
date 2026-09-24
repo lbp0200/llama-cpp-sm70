@@ -30,6 +30,28 @@
 5. V100 回线后：**sm_70 验证 route B 引擎**（Volta C-layout 上游分支已备，但我们的 lane 版
    ldm/get_i wrapper 需在 sm70 上验证）；按用户指示恢复生产服务
 
+## 外部参考源（2026-09-24 侦察，`~/SharedData/ninfer-v100`）
+
+单卡 V100 的自研 C++/CUDA 推理引擎（Qwen3.8-27B：decode 峰值 219 tok/s、prefill ~1085 tok/s、
+INT8 group-64 KV）。三处直接价值：
+
+1. **`src/ops/common/volta_mma.cuh`（153 行）= V100 侧 fragment/布局参考（最有用）**：逐字转录
+   llama.cpp `mma.cuh`，且**语义操作数角色按 Volta fattn-mma-f16 的调用点确定、不按 tile 形状推断**
+   （正是我们 probe5 之前踩的坑）；给出 Volta 真实原语 **`mma.sync.m8n8k4`**（非 Turing 的
+   m16n8k16）、K 操作数 `I_MAJOR_MIRRORED`（4 组 8 lane 复制）、Q/K/D/P/V 各角色的每线程寄存器数
+   与 `get_i/get_j`，且**已对独立 host oracle 校验**。-> route B 引擎搬 sm_70（V100 回线后）时
+   lane 版 wrapper 的 Volta 分支可照抄，省一轮 probe
+2. **`src/ops/launcher/gqa_attention_volta_flash.cu`（611 行）= V100 长 causal prefill 的现成路由**：
+   独立驱动 vendored llama.cpp `fattn-mma-f16`（pin `62bf73d25`），自带 **stream-K 分解**、按几何缓存
+   config、smem 预算样板 —— 与我们实测「旧路径长 prefill 更强」（V100 pp65536 469 vs 我们 333）
+   结论一致。若做 V100 混合派发（长 prefill 交给旧内核），这是现成配方；也可 diff 其 vendored 副本
+3. **数值/KV 压缩对标**：INT8 group-64 KV + 对持久 K 与瞬时 Q 施加归一化 **D256 Hadamard 变换**
+   （与 TurboQuant WHT 同族：他们在 FA 前旋转并压到 INT8，我们压到 turbo2/3/4 位）；
+   `docs/performance/methodology.md` 的测量/发布规则可当外部标尺
+
+边界：不含自研 softmax-FA 新内核（长 prefill 借 llama.cpp，解码侧为 m8n8k4 自研 exact Volta kernels，
+与我们的 m16n8k16 不同代际）；强制 CUDA 12.8（CUDA 13 砍掉 Volta 离线编译）；V100 当前离线，(1)(2) 先读不能验。
+
 ## 铁律（每次改动必跑，本文件下半部有全部出处）
 
 - 门禁：`test-backend-ops -o FLASH_ATTN_EXT -p "hsk=256"` -> 470/470（默认路 + `GGML_V100_FA_MMA=1` 两路）
