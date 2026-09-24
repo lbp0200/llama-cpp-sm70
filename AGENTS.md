@@ -54,6 +54,12 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
   friendly, and it exercises the Volta FA kernel gate (`GGML_V100_FA`,
   cc == 700 || cc == 750, both supported since 06837a189).
 - Build on the box: `cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75`.
+- **Code sync: `./sync-2070.sh`** (rsync over the `bolt-remote` alias; copies the whole
+  tree including uncommitted work, excludes `build/`, `.pi/` and the probe binaries, then
+  re-pins the box's `origin` to an anonymous read-only https URL). The Mac is the only
+  pusher, so **the 2070 needs no GitHub credentials and no private key** - do not register
+  a key for it or run `git push` there. A stale `~/.ssh/id_rsa` copy may exist on the box;
+  nothing in this workflow uses it.
 - The V100 box (192.168.7.3, sm_70, 32 GB) stays the large-model/long-context
   validation environment (Qwen3.8-27B IQ4_XS etc.).
 - Volta/SM75 FA work lives on branch `feature/v100-fa-port`
