@@ -16,15 +16,19 @@
 **route B mma 引擎（正确、opt-in：`GGML_V100_FA_MMA=1`）**
 - 正确性：470/470（默认路 + 显式路）、sweep 7747/7747、冒烟正常
 - 性能阶梯 pp4096：1771 -> 1762（swizzle，瓶颈证伪，保留）-> 1813（删冗余 sync + ef 惰性化）
-  -> 1841.5（Q_in_reg 窗口化）-> **2115.6（rescale 增长守卫，+14.9%）**；累计 **+20%**，距 wmma pair 仍 **-22.5%**
+  -> 1841.5（Q_in_reg 窗口化）-> **2115.6（rescale 增长守卫，+14.9%）** -> **2171.2（comb 扫描 shfl 化，+2.6%）**；
+  累计 **+22.6%**，距 wmma pair **-20.5%**
 
 ## 待办（按优先级，下个 session 直接开工）
 
-1. **comb 扫描 shfl 化**（上一轮收 +14.9% 的同一类「集中式寄存器代价」）：`sn[16]` 目前每 lane
-   扫全 16 行（64 smem 读 + 48 fmax）；改为 lane i 算一行 + `shfl` 广播，每 lane 实际只需 6 行
-   （fi 的 2 + fj 的 4），grew 顺带 shfl 归约。预期再 +5~10%
-2. **跨 warp softmax -> 列内 warp 组织**（最大剩余结构差异）：我们每 tile 5 sync + scratch 两次
-   往返 + publish；旧路径 np-warp 列内 shfl、无 scratch 无 publish
+1. ~~comb 扫描 shfl 化~~ **已完成**（本 commit；pp4096 2115.6 -> 2171.2，+2.6%；累计 +22.6%，
+   差距 -20.5%；gate 470/470 ×2 + sweep 7747 + 冒烟 "Hello world." 全绿）。改法：每 lane 只算自己
+   需要的 6 行（`a=lane/4`、`a+8` 已在 `mx_a/mx_b` 里且组内 4 lane 同值；O 行 `c,c+1,c+8,c+9` 用
+   4 条 `__shfl_sync` 取），`grew` 只覆盖本 lane 的 O 行（正是它 rescale 的行，判据仍严格），
+   publish（warp0）自行合并 16 行不再读 `sn[]`。**收益只有 +2.6% => 扫描不是大头**
+2. **publish / 跨 warp softmax（下个首选）**：每 tile 有 5 次 `__syncthreads()` + scratch 两次往返，
+   且 warp0 的 8 个 lane 要串行做 16 行（16 expf + 32 次 smem 读写）——这也解释了 #1 的低收益。
+   旧路径 np-warp 列内 shfl、无 scratch 无 publish
 3. **Q 全 D 常驻**（16 frag = 64 regs，实测 spill）与 **launch_bounds(256,2) 对拍**
 4. 目标线：先 >=2731（超 wmma pair），再 >=2900（原验收线），tg 保持 108
 5. V100 回线后：**sm_70 验证 route B 引擎**（Volta C-layout 上游分支已备，但我们的 lane 版
@@ -60,6 +64,8 @@ INT8 group-64 KV）。三处直接价值：
   双 PASS 再动内核 —— 历史上这两个探针各抓到一类致命 bug（`ldmatrix`/`get_i` 的裸 `threadIdx.x`
   单 warp 陷阱；xor 归约写成赋值而非组合）
 - 证据落盘：bench 全部 `tee` 进 `sm75-优化存档/` 并随 commit 入库（该目录已加 gitignore 例外）
+- 远程跑脚本：**`scp` 到机器再 `bash /tmp/x.sh </dev/null`**；不要 `ssh 'bash -s' < file` ——
+  `llama-cli` 会吃掉 stdin 里剩余的脚本行（曾整段吞掉 bench，日志只剩 15 行）
 - 对照开关：`GGML_V100_FA_MMA=0`（pair wmma）/ `GGML_V100_FA=0`（上游 mma）随时 A/B
 - ncu 不可用（`ERR_NVGPUCTRPERM`，需 root 改驱动参数并重启）-> 性能问题只能靠 A/B 阶梯二分
 - **代码同步到 2070：`./sync-2070.sh`**（rsync，全树含未提交状态；排除 `build/`、`.pi/`、探针二进制；

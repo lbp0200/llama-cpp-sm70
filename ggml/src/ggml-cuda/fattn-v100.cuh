@@ -578,32 +578,52 @@ flash_attn_ext_v100_kernel(
         }
         __syncthreads();
 
-        // combined tile max per row, online softmax factors (all lanes read
-        // the old row state before warp0 of the group publishes the update)
-        float sn[16];
-        bool grew = false;
-        for (int r = 0; r < 16; ++r) {
-            const int act = m_tile * 16 + r;
-            float comb = sScrMax[act * 4 + 0];
-            for (int ss = 1; ss < N_SUBS; ++ss) {
-                comb = fmaxf(comb, sScrMax[act * 4 + ss]);
-            }
-            const float old_max = sRowMax[act];
-            const float new_max = fmaxf(old_max, comb);
-            sn[r] = new_max > -1e30f ? new_max : 0.0f;
-            grew |= sn[r] > old_max;
+        // Combined tile max per row, online softmax factors. A lane touches
+        // only its own rows: rows a = lane/4 and a+8 (the S exponents) plus
+        // its O rows c, c+1, c+8, c+9 with c = (lane%4)*2. The in-warp maxima
+        // of rows a/a+8 are already in mx_a/mx_b and all four lanes of a group
+        // hold the same value, so the other rows arrive by shfl. Scanning all
+        // 16 rows from smem costs 64 LDS + 48 FMAX in every lane of the block.
+        const int a   = mma_lane / 4;
+        const int c   = (mma_lane % 4) * 2;
+        const int r0  = m_tile * 16;
+        float cmb_a = mx_a;
+        float cmb_b = mx_b;
+        for (int ss = 0; ss < N_SUBS; ++ss) {
+            cmb_a = fmaxf(cmb_a, sScrMax[(r0 + a) * 4 + ss]);
+            cmb_b = fmaxf(cmb_b, sScrMax[(r0 + a + 8) * 4 + ss]);
         }
+        const float m_c  = __shfl_sync(0xffffffffu, cmb_a, 4 * c);
+        const float m_c1 = __shfl_sync(0xffffffffu, cmb_a, 4 * (c + 1));
+        const float m_c8 = __shfl_sync(0xffffffffu, cmb_b, 4 * c);
+        const float m_c9 = __shfl_sync(0xffffffffu, cmb_b, 4 * (c + 1));
+        const float om_a  = sRowMax[r0 + a];
+        const float om_b  = sRowMax[r0 + a + 8];
+        const float om_c  = sRowMax[r0 + c];
+        const float om_c1 = sRowMax[r0 + c + 1];
+        const float om_c8 = sRowMax[r0 + c + 8];
+        const float om_c9 = sRowMax[r0 + c + 9];
+        const auto nmax = [](const float om, const float cb) {
+            const float nm = fmaxf(om, cb);
+            return nm > -1e30f ? nm : 0.0f;
+        };
+        const float sn_a  = nmax(om_a,  cmb_a);
+        const float sn_b  = nmax(om_b,  cmb_b);
+        const float sn_c  = nmax(om_c,  m_c);
+        const float sn_c1 = nmax(om_c1, m_c1);
+        const float sn_c8 = nmax(om_c8, m_c8);
+        const float sn_c9 = nmax(om_c9, m_c9);
         // The rescale is the identity whenever no row's running max grew
-        // (ef == 1), which is the common case after the first few tiles. The
-        // guard is uniform: every lane derives it from the same 16 smem values.
+        // (ef == 1), which is the common case after the first few tiles. Each
+        // lane tests the O rows it rescales, so the guard needs no broadcast.
+        const bool grew = (sn_c > om_c) | (sn_c1 > om_c1) | (sn_c8 > om_c8) | (sn_c9 > om_c9);
         if (block_n > 0 && grew) {
             // ef lazily for this lane's four O rows instead of all16: the
             // O element rows are fj(l) = {c, c+1, 8+c, 9+c}, c = (lane%4)*2
-            const int c = (mma_lane % 4) * 2;
-            const float ef0 = expf(fmaxf(sRowMax[m_tile * 16 + c]     - sn[c],     -80.0f));
-            const float ef1 = expf(fmaxf(sRowMax[m_tile * 16 + c + 1] - sn[c + 1], -80.0f));
-            const float ef8 = expf(fmaxf(sRowMax[m_tile * 16 + c + 8] - sn[c + 8], -80.0f));
-            const float ef9 = expf(fmaxf(sRowMax[m_tile * 16 + c + 9] - sn[c + 9], -80.0f));
+            const float ef0 = expf(fmaxf(om_c  - sn_c,  -80.0f));
+            const float ef1 = expf(fmaxf(om_c1 - sn_c1, -80.0f));
+            const float ef8 = expf(fmaxf(om_c8 - sn_c8, -80.0f));
+            const float ef9 = expf(fmaxf(om_c9 - sn_c9, -80.0f));
             for (int t = 0; t < 16; ++t) {
                 for (int l = 0; l < 8; ++l) {
                     o_mma[t].x[l] *= (l & 4) ? ((l & 1) ? ef9 : ef8) : ((l & 1) ? ef1 : ef0);
@@ -611,7 +631,7 @@ flash_attn_ext_v100_kernel(
             }
         }
         for (int l = 0; l < S.ne; ++l) {
-            S.x[l] = expf(fmaxf(S.x[l] - sn[fi(l)], -80.0f));
+            S.x[l] = expf(fmaxf(S.x[l] - (((l >> 1) & 1) ? sn_b : sn_a), -80.0f));
         }
 
         // partial row sums for this sub -> cross-warp combine
@@ -628,16 +648,25 @@ flash_attn_ext_v100_kernel(
             sScrSum[act_b * 4 + sub] = sum_b;
         }
         __syncthreads();
+        // warp0 of the group owns the row state: it rescales and publishes it,
+        // so it combines the 16 rows here instead of reading them from sn[].
         if (w_id % MMA_WARP_M == 0 && lane % 4 == 0) {
             for (int r = 0; r < 16; ++r) {
-                const int act = m_tile * 16 + r;
+                const int act = r0 + r;
+                float comb = sScrMax[act * 4 + 0];
+                for (int ss = 1; ss < N_SUBS; ++ss) {
+                    comb = fmaxf(comb, sScrMax[act * 4 + ss]);
+                }
+                const float om = sRowMax[act];
+                const float nm = fmaxf(om, comb);
+                const float snr = nm > -1e30f ? nm : 0.0f;
                 float tot = 0.f;
                 for (int ss = 0; ss < N_SUBS; ++ss) {
                     tot += sScrSum[act * 4 + ss];
                 }
-                const float ef = expf(fmaxf(sRowMax[act] - sn[r], -80.0f));
+                const float ef = expf(fmaxf(om - snr, -80.0f));
                 sRowSum[act] = ef * sRowSum[act] + tot;
-                sRowMax[act] = sn[r];
+                sRowMax[act] = snr;
             }
         }
         // E1: no barrier after the publish - the next tile's sync1/sync2 pair

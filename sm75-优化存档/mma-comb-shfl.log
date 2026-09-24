@@ -1,0 +1,29 @@
+--- gate default (count) ---
+  470/470 tests passed
+2/2 backends passed
+--- gate MMA=1 (count) ---
+  470/470 tests passed
+2/2 backends passed
+--- sweep MMA=1 (count) ---
+  7747/7747 tests passed
+2/2 backends passed
+--- smoke MMA=1 ---
+
+> 
+
+Exiting...
+--- bench MMA=1 (comb shfl) ---
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp1024 |      2636.08 ± 86.57 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp4096 |       2171.23 ± 5.40 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |            tg32 |        108.03 ± 0.50 |
+
+build: 1bb36449b (10799)
+--- bench default (wmma pair ref) ---
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp1024 |     2969.24 ± 118.34 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp4096 |       2729.44 ± 0.70 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |            tg32 |        107.59 ± 0.51 |
+
+build: 1bb36449b (10799)
+DONE
+
+__BGRUN_EXIT__=0
