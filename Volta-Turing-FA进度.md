@@ -29,6 +29,8 @@
 2. **publish / 跨 warp softmax（下个首选）**：每 tile 有 5 次 `__syncthreads()` + scratch 两次往返，
    且 warp0 的 8 个 lane 要串行做 16 行（16 expf + 32 次 smem 读写）——这也解释了 #1 的低收益。
    旧路径 np-warp 列内 shfl、无 scratch 无 publish
+   -> **设计档见文末「设计档案：publish / 跨 warp softmax 重构」**（5 个 barrier 的 hazard 表 +
+   两个局部候选：publish 改 16 lane 各 1 行、V 载入提前到 publish 前；K/V union 分离已否决）
 3. **Q 全 D 常驻**（16 frag = 64 regs，实测 spill）与 **launch_bounds(256,2) 对拍**
 4. 目标线：先 >=2731（超 wmma pair），再 >=2900（原验收线），tg 保持 108
 5. V100 回线后：**sm_70 验证 route B 引擎**（Volta C-layout 上游分支已备，但我们的 lane 版
@@ -727,3 +729,51 @@ mma/ldmatrix PTX 本身按硬件 lane 工作，任意 blockDim 无碍 —— 只
 - **smem 92KB**：cudaFuncSetAttribute opt-in
 - sm_70/75 D512 VEC stub：CUDA 上从不 dispatch，零语义影响
 - 调试工具（2.16 上 /tmp）：probe1/2/3（QK/softmax/PV 微测）、fa_ab.cpp（CPU/CUDA 后端 A/B 微测）
+## 设计档案：publish / 跨 warp softmax 重构（待办 #2，2026-09-24）
+
+### 现状：每 tile 5 个 barrier（`fattn-v100.cuh` 的 `mma_tile_body(block_n)` lambda）
+
+| # | 位置 | 覆盖的 hazard |
+|---|------|----------------|
+| E | tile 尾部/下个 tile 的 K 写入前 | 下一 tile 的 K 存 vs 本 tile PV 读 V（**K/V 共用同一个 smem union**）|
+| A | K 载入后 | 本 tile 的 K 存 vs 各 warp 的 ldmatrix 读 |
+| B | `sScrMax` 写后 | N_SUBS 个 sub 的部分行最大值跨 warp 可见（comb 要读全部 4 份）|
+| C | `sScrSum` 写后 | N_SUBS 个 sub 的部分行和跨 warp 可见（publish 要读全部 4 份）|
+| D | V 载入后 | V 存 vs PV mma 的 ldmatrix 读 |
+
+结构事实（决定哪些能省）：
+
+- 一行的 64 个 KV 列被 **4 个 sub-warp 切分**，行最大值/行和**天然跨 warp** —— 这就是 B/C 存在的原因；
+  旧路径（np-warp 列内组织、无 scratch 无 publish）在数据布局上根本不需要它们。
+- **publish 是发散串行段**：`w_id % MMA_WARP_M == 0 && lane % 4 == 0` 选中 8 个 lane，
+  串行跑 16 行（每行 8 次 smem 读 + expf + 2 次写）；其余 7 个 warp 空等至 sync D。
+- **E1 不变式（必须保持）**：publish 后无 barrier，正确性依赖「下一 tile 的 sync A 之前无人读
+  `sRowMax`」（读 `sRowMax` 的只有 comb 与本 publish，都在 sync A 之后）。
+- 已实测：comb 扫描 shfl 化只 +2.6% => **softmax 的 ALU 量不是瓶颈**，成本在 barrier 与发散段。
+
+### 候选（按 收益/风险 排序，均为局部改动）
+
+1. **publish 去串行化（首选）**：把 16 行从「8 lane x 16 趟」改为 `lane < 16` 各 1 行
+   （`for (int r = lane; r < 16; r += 16)`）。写目标是不同行（`sRowSum[act]`/`sRowMax[act]`），无冲突；
+   行只被处理一次，语义不变。串行段 16 趟 -> 1 趟（~320 条指令 -> ~20 条）。预期 +3~6%，风险低。
+2. **V 载入提前到 publish 之前（次选，近乎免费）**：现顺序为 `sync C -> publish -> V 载入 -> sync D`。
+   sync C 之后所有 warp 的 K ldmatrix 读已结束，故 V 写 union 是安全的；把 V 载入移到 publish 之前，
+   非 warp0 的 gmem 延迟与 warp0 的 publish 重叠（总时长 ~max(publish, Vload) 而非二者之和）。
+   需先确认 `load_kv_f16_to_smem` 内部没有自己的 barrier。预期 +1~3%，风险低。
+3. **K/V union 分离以便更早预取**：V(BN64 x D256 f16) 约 32KB，K 同尺寸，union 已占 smem 主体
+   （总量约 50.6KB / 64KB）——分离直接爆预算（A/B/C 档案已论证 BN64 变体超 64KB）。**否决**。
+
+### 否决/存疑
+
+- **scratch 双缓冲（parity）**：B/C 是「跨 warp 生产-消费」，双缓冲不能删掉它们；tile 尾部的 E 也不
+  由 scratch 引起（是 K/V union）。**无收益，不做**。
+- **期望管理**：上述全部做完可能只有 +5~10%，**不足以填补 -20.5%**。若目标是 2900，最终仍需结构性
+  改变（让一行的全部列落在同一 warp = 旧路径的列向组织，或走 split-KV + combine），那是一次重写量级，
+  需单独设计档与预算。
+
+### 验证计划（每次改动同一套）
+
+1. `./run-2070.sh sm75-优化存档/gate-2070.sh`（470/470 x2 + sweep 7747/7747）
+2. 冒烟：`GGML_V100_FA_MMA=1 llama-cli ... -no-cnv </dev/null` 必须输出 "Hello world."
+3. A/B：`GGML_V100_FA_MMA=1 llama-bench -p 1024,4096 -n 32 -r 3`，对照当前 pp4096 **2171.2**、
+   tg32 **108.0**（回退即止损：任何一项变差就回滚，不入库）
