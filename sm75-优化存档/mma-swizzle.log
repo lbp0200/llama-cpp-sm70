@@ -6,3 +6,8 @@ Hello, world.
 | gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp1024 |      2378.27 ± 81.36 |
 | gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp4096 |       1761.79 ± 0.55 |
 | gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |            tg32 |        107.96 ± 0.56 |
+# E1(sync-drop)+E3(lazy-ef) 2026-09-24T09:06:07Z
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp1024 |      2420.84 ± 70.45 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp4096 |       1813.06 ± 1.17 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |            tg32 |        108.05 ± 0.46 |
+# E1+E3+Qwin 2026-09-24T09:19:56Z pp4096=1841.5

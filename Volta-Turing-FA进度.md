@@ -580,6 +580,8 @@ mma/ldmatrix PTX 本身按硬件 lane 工作，任意 blockDim 无碍 —— 只
 `GGML_V100_FA_MMA` 默认改为**显式1才启用**，主干行为保持 wmma pair（2731）。
 两路都进门禁（回退显式 470 过）。
 
+**性能阶梯（pp4096，全部门禁绿）：** 首版 1771 -> swizzle 1762（证伪）-> 删冗余 sync + ef 惰性化 **1813 (+2.9%)** -> Q_in_reg 窗口化（8-frag 双窗）**1841.5 (+4.5% 累计)**；仍距 wmma pair 2731 约 -33%。两个微杠杆已入库；Q 窗口踩坑记录：窗口内层步长必须是 8 h2（k16），写成 1 会越界读 + 重复累加 k（曾致 GPU fault，backtrace 定位）。
+
 **性能嫌疑清单（下 session 按序 A/B，probe5/6 保回归）：**
 1. ~~ldmatrix 无 swizzle~~ **已证伪（2026-09-24 swizzle 化实测 1771 -> 1762，噪声内）**：
    swizzle 本身保留（正确、省 smem 1.5KB、对齐旧路径惯例、bytes_rc 写读同图 +
@@ -591,7 +593,12 @@ mma/ldmatrix PTX 本身按硬件 lane 工作，任意 blockDim 无碍 —— 只
 2. **sn/ef 每 warp 重复计算**：comb 扫描+16 expf x8 warps，且 S-exp 又一遍
    —— 可合并为行主小组内一次（wmma 的 THREADS_PER_ROW 结构天然只算一份）
 3. 每 tile 6 个 sync（wmma pair ~5）+ 寄存器化 O 的 128 fma rescale/tile
-4. Q 每 k-step 从 smem 重载 x4 warps（Q_in_reg=档案 v2 未走的杠杆）
+4. ~~Q 每 k-step 重载~~ 已做窗口化（+1.6%）；剩余：全 D 常驻 Q（16 frag=64 regs，可能 spill，
+   需实测）、以及**跨 warp softmax（scratch+publish+3 barrier）vs 旧路径列内 warp 组织**
+   ——这是与 3054 旧路径最大的结构差异（我们的每 tile 6->5 sync + 两次 scratch 往返，
+   旧路径 np-warp 列内 shfl 全在 warp 内、无 smem scratch 无 publish），列为下一个大杠杆
+5. launch_bounds(256,1) 寄存器调度（wmma 是 (256,2) 编译）；ncu 因 ERR_NVGPUCTRPERM
+   不可用（需 root 改 NVreg_RestrictProfilingToAdminUsers+重启），只能靠 A/B 阶梯二分
 5. launch_bounds(256,1) 的寄存器调度差异（wmma 是 (256,2) 编译）
 调优后目标：先 >=2731（超 wmma），再 >=2900（原验收线），tg 保持 108。
 

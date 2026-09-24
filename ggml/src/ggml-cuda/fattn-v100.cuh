@@ -527,12 +527,20 @@ flash_attn_ext_v100_kernel(
         }
         const half2 * sQ_h2c = (const half2 *) sQ;
         const half2 * sK_h2c = (const half2 *) sK;
-        for (int k0h = 0; k0h < 128; k0h += 8) {
-            tile<16, 8, half2> A;
-            tile<16, 8, half2> B;
-            ldm16x8_swz(A, sQ_h2c, m_tile * 16, k0h, CFG::Q_STRIDE / 2);
-            ldm16x8_swz(B, sK_h2c, sub * 16, k0h, CFG::KV_STRIDE / 2);
-            mma(S, A, B);
+        // Q_in_reg in windows of 8 (old path keeps all of Q resident): Q is
+        // loaded once per window instead of every k step, B stays per step.
+        tile<16, 8, half2> Qw[8];
+        for (int w0 = 0; w0 < 128; w0 += 64) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                ldm16x8_swz(Qw[i], sQ_h2c, m_tile * 16, w0 + i * 8, CFG::Q_STRIDE / 2);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                tile<16, 8, half2> B;
+                ldm16x8_swz(B, sK_h2c, sub * 16, w0 + i * 8, CFG::KV_STRIDE / 2);
+                mma(S, Qw[i], B);
+            }
         }
 
         // scale + mask straight into the register tile; mask -inf handles kv
@@ -573,7 +581,6 @@ flash_attn_ext_v100_kernel(
         // combined tile max per row, online softmax factors (all lanes read
         // the old row state before warp0 of the group publishes the update)
         float sn[16];
-        float ef[16];
         for (int r = 0; r < 16; ++r) {
             const int act = m_tile * 16 + r;
             float comb = sScrMax[act * 4 + 0];
@@ -583,12 +590,18 @@ flash_attn_ext_v100_kernel(
             const float old_max = sRowMax[act];
             const float new_max = fmaxf(old_max, comb);
             sn[r] = new_max > -1e30f ? new_max : 0.0f;
-            ef[r] = expf(fmaxf(old_max - sn[r], -80.0f));
         }
         if (block_n > 0) {
+            // ef lazily for this lane's four O rows instead of all16: the
+            // O element rows are fj(l) = {c, c+1, 8+c, 9+c}, c = (lane%4)*2
+            const int c = (mma_lane % 4) * 2;
+            const float ef0 = expf(fmaxf(sRowMax[m_tile * 16 + c]     - sn[c],     -80.0f));
+            const float ef1 = expf(fmaxf(sRowMax[m_tile * 16 + c + 1] - sn[c + 1], -80.0f));
+            const float ef8 = expf(fmaxf(sRowMax[m_tile * 16 + c + 8] - sn[c + 8], -80.0f));
+            const float ef9 = expf(fmaxf(sRowMax[m_tile * 16 + c + 9] - sn[c + 9], -80.0f));
             for (int t = 0; t < 16; ++t) {
                 for (int l = 0; l < 8; ++l) {
-                    o_mma[t].x[l] *= ef[fj(l)];
+                    o_mma[t].x[l] *= (l & 4) ? ((l & 1) ? ef9 : ef8) : ((l & 1) ? ef1 : ef0);
                 }
             }
         }
@@ -617,11 +630,14 @@ flash_attn_ext_v100_kernel(
                 for (int ss = 0; ss < N_SUBS; ++ss) {
                     tot += sScrSum[act * 4 + ss];
                 }
-                sRowSum[act] = ef[r] * sRowSum[act] + tot;
+                const float ef = expf(fmaxf(sRowMax[act] - sn[r], -80.0f));
+                sRowSum[act] = ef * sRowSum[act] + tot;
                 sRowMax[act] = sn[r];
             }
         }
-        __syncthreads();
+        // E1: no barrier after the publish - the next tile's sync1/sync2 pair
+        // orders every read of the row state behind warp0's write, and the
+        // publish stores target disjoint addresses from the V union.
 
         // PV: V into the union slot (S stays in registers), P = get_half2(S),
         // O[d-tile] += V . P (probe5: maxerr 0, i=d j=Q layout).
