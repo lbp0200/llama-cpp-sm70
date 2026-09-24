@@ -61,14 +61,23 @@ struct cfg {
 
     static constexpr int D256_PAD = 0; // (8 - (256 % 32) + 32) % 32
 
-    static constexpr int Q_STRIDE  = 256 + D256_PAD;
+    // Q gets the same row-pitch skew on Turing only (WMMA A-side traffic is
+    // larger than K and the 64KB budget has room); V100 stays byte-identical.
+    static constexpr int Q_PAD = (THREADS_PER_BLOCK_ >= 512) ? 0 : 8;
+    static constexpr int Q_STRIDE  = 256 + Q_PAD + D256_PAD;
     // Row-pitch bank skew for the K/V WMMA loads. V100 (96KB smem) can afford
     // +16 halfs; Turing (64KB cap, P_SUB_TILE=64 in the budget) takes +8, which
     // still moves every row start by 4 banks and breaks the 512B alignment.
+    // Pad must be a multiple of 8 halfs: the row byte pitch has to stay 16B
+    // aligned or wmma load_matrix_sync faults with "misaligned address"
+    // (pad 4 -> 520B pitch crashed; pad 8 -> 528B is fine).
     static constexpr int KV_PAD = (THREADS_PER_BLOCK_ >= 512) ? 16 : 8;
     static constexpr int KV_STRIDE = 256 + KV_PAD;
     static constexpr int S_STRIDE  = BLOCK_N + D256_PAD;
-    static constexpr int P_STRIDE  = P_SUB_TILE + D256_PAD;
+    // P: same Turing-only skew (PV A-side loads; 128B row pitch is fully
+    // bank-aligned). smem stays at 65216B < 64KB.
+    static constexpr int P_PAD = (THREADS_PER_BLOCK_ >= 512) ? 0 : 8;
+    static constexpr int P_STRIDE  = P_SUB_TILE + P_PAD + D256_PAD;
     static constexpr int O_STRIDE  = 256 + D256_PAD;
 
     static constexpr float NEG_INF = -1e30f;
