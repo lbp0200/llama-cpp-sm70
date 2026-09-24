@@ -916,3 +916,33 @@ graph 空指针 491ecdd04），不是提速项。
 
 因此 `GGML_V100_FA` 的默认值理应也为 OFF（与 2070 同理）；当前代码仍是 `cc == VOLTA` 默认开，
 **因 V100 离线无法复测而暂不翻转**，留待机器回线后重测 A/B 再定（或按用户指示直接翻转）。
+
+### 谱系澄清：`fattn-v100.cuh` 到底是不是「1Cat split-D WMMA 的移植」（2026-09-24）
+
+文件自己的头部（`fattn-v100.cuh:3-13`）写的是 **「1Cat FLASH_ATTN_V100 dataflow ported to ggml」**，
+列出两条参考：1Cat 的 `flash-attention-v100/kernel/fused_mha_forward.cu`，以及 llama.cpp #28037
+（「Volta config tuning is near-optimal; 剩余的 headroom 是架构性的：split-D dataflow、fp32 score smem、
+无 cp.async」）。据此逐条核对：
+
+**从 1Cat 真正拿过来的**
+- dataflow 思路：QK 分数物化在 fp32 smem、32 列子块 softmax、PV 用 WMMA 从 smem 读概率、D=256 时
+  16 warps / BLOCK_M=32 / BLOCK_N=64 的块划分（v1 形态）
+- 一处具体产物：`nvcuda::wmma m16n16k16` fragment -> (row, col) 的展开表（`:712` 注释标 "from 1Cat"）
+
+**没有移植的**
+- **split-D dataflow 本身没有实现**：头部把它列为「剩余 headroom」；全文件 `split` 只出现在 (a) 头部、
+  (b) `:504` 的「warps split into m-tiles x n16 **kv subs**」——那是按 KV 列切分，不是按 head-dim 切分。
+  即：**「split-D WMMA 移植」这个说法不准确，split-D 从未落地**。
+
+**落地形态与 1Cat 原设计的偏离（本季 tuning 的结果）**
+| 变体 | 形态 | 与 1Cat 原设计的关系 |
+|---|---|---|
+| v1 | WMMA + fp32 score smem | 最接近 1Cat dataflow |
+| `cfg_sm75`（solo）| BM16/BN64/256 线程 | 为 Turing 64KB smem 收窄 M tile |
+| 路线 A pair（现 sm_75 默认已不用）| BM32/BN48/256 + 寄存器 O + GQA×2 双头 band | 重设计（O 进寄存器，偏离 smem 分数设计）|
+| 路线 B mma 引擎（opt-in）| `mma.sync m16n8k16`，分数留在**寄存器** | 进一步偏离 1Cat 的「分器物化到 fp32 smem」|
+
+**结论**：准确表述是「**以 1Cat FLASH_ATTN_V100 的 dataflow 为起点、用 llama.cpp 约定重写的 FA 内核**；
+split-D（1Cat 最核心的架构性差异）与 cp.async 流水从未移植」。而 #28037 那条参考本身就预告了今天的结局：
+上游在既有融合内核设计上的调优已近最优，剩余空间全在 split-D / fp32 smem / cp.async 这些**架构性**方向——
+这也解释了为什么我们从未跑赢上游。
