@@ -62,7 +62,7 @@ struct cfg {
     static constexpr int D256_PAD = 0; // (8 - (256 % 32) + 32) % 32
 
     static constexpr int Q_STRIDE  = 256 + D256_PAD;
-    static constexpr int KV_STRIDE = 256 + D256_PAD;
+    static constexpr int KV_STRIDE = 256 + 16; // +16 halfs: row-pitch bank skew (probe)
     static constexpr int S_STRIDE  = BLOCK_N + D256_PAD;
     static constexpr int P_STRIDE  = P_SUB_TILE + D256_PAD;
     static constexpr int O_STRIDE  = 256 + D256_PAD;
