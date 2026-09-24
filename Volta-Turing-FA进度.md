@@ -478,6 +478,24 @@ sinks/dst/pair band），300+ 行新代码 + 3-6 轮构建门禁，单 session �
   (2x16 band) 下复核；寄存器预算重估（KQ_C+VKQ_C 驻留 ~160 f32/thread，launch_bounds(2)
   可能需降为 (1)）；mask 直读 gmem vs tile_mask 预取需实测取舍
 
+### 路线 B probe5 实证结果（2026-09-24 下午，sm75 实测 maxerr=0.0000）
+
+操作数方向风险清零，两条配方均**精确 0**（非简并数据、含 f16 舍入的参考）：
+- **QK**：A = plain ldmatrix 自 sQ[Q行][k-fast]；B = plain ldmatrix 自 sK[KV行][k-fast]；
+  k 按 half2 步进 8（=16 half）循环重载累加（probe 曾漏 k 循环 -> 部分和假错）；
+  `mma(S, A, B)` -> S tile<16,16,float>，**get_i = Q 行，get_j = KV 列**
+- **PV**：A = `load_ldmatrix_trans(sV)`（直接吃 gmem 布局 [KV行][d-fast]，**无需转置缓冲**）；
+  B = `get_half2(S)`（分数原地打包，内核里放 exp 后的 P 即可）；
+  `mma(O, A, B)` -> O tile<16,16,float>，**get_i = d，get_j = Q 行**
+- 否决假设：trans-B、Kt 转置缓冲、手工 sVT（half2 对单位错：对齐 d 而非 kv）、
+  双操作数 smem 往返（R2 证明 PV 免往返）
+- probe 六坑（后人避雷）：half2 无 operator[]；输出 __int_as_float 双转换全打成 0；
+  数据生成器简并（j*5 mod5 -> 所有 K 行相同）；**漏 k 循环**（部分和 vs 全和）；
+  exp_o 参考把 score(i,j) 当 score(i,kv) 求和；打印槽位互相覆盖
+- 构建行：`nvcc -arch=sm_75 -DGGML_USE_CUDA -I ggml/include -I ggml/src probe5.cu -o probe5 -lcuda -lcublas`
+  （需 ggml_cuda_error/ggml_abort/ggml_cuda_get_device 三个桩）
+- 状态：**QK+PV 原子已实证，内核移植（pair-mma 引擎）可按设计档案直接开工**，最后的地雷已排
+
 **备选（若只要数字）**：pair 形状派发级转调上游 mma 内核（20 行，pp4096 立得 ~3054），
 代价=pair wmma 引擎变成无人执行的死代码、门禁不再覆盖它 -> 不推荐，除非用户明示。
 
