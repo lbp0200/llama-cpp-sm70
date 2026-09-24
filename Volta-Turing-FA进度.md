@@ -62,7 +62,11 @@ INT8 group-64 KV）。三处直接价值：
 - 证据落盘：bench 全部 `tee` 进 `sm75-优化存档/` 并随 commit 入库（该目录已加 gitignore 例外）
 - 对照开关：`GGML_V100_FA_MMA=0`（pair wmma）/ `GGML_V100_FA=0`（上游 mma）随时 A/B
 - ncu 不可用（`ERR_NVGPUCTRPERM`，需 root 改驱动参数并重启）-> 性能问题只能靠 A/B 阶梯二分
-- 远端 git：origin 曾走 gh-proxy（间歇 403），已改直连；远端出现未跟踪同名文件挡 pull 时先 `rm`
+- **代码同步到 2070：`./sync-2070.sh`**（rsync，全树含未提交状态；排除 `build/`、`.pi/`、探针二进制；
+  同步后把 2070 的 origin 固定为匿名只读 `https://github.com/...`）。**2070 不做 GitHub 认证、不放私钥**，
+  推送只在 Mac 端做。历史上 gh-proxy 间歇 403 / 未跟踪文件挡 pull 的问题随 rsync 一并消失
+- 2070 上 `~/.ssh/id_rsa` 是从 Mac 拷过去、且未在 GitHub 登记的旧私钥副本（2026-09-08）——已确认
+  该框的 GitHub SSH 认证不可用；本工作流不需要它，建议删除（见对话记录）
 
 ---
 
