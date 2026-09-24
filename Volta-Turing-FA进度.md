@@ -580,7 +580,11 @@ mma/ldmatrix PTX 本身按硬件 lane 工作，任意 blockDim 无碍 —— 只
 `GGML_V100_FA_MMA` 默认改为**显式1才启用**，主干行为保持 wmma pair（2731）。
 两路都进门禁（回退显式 470 过）。
 
-**性能阶梯（pp4096，全部门禁绿）：** 首版 1771 -> swizzle 1762（证伪）-> 删冗余 sync + ef 惰性化 **1813 (+2.9%)** -> Q_in_reg 窗口化（8-frag 双窗）**1841.5 (+4.5% 累计)**；仍距 wmma pair 2731 约 -33%。两个微杠杆已入库；Q 窗口踩坑记录：窗口内层步长必须是 8 h2（k16），写成 1 会越界读 + 重复累加 k（曾致 GPU fault，backtrace 定位）。
+**性能阶梯（pp4096，全部门禁绿）：** 首版 1771 -> swizzle 1762（证伪）-> 删冗余 sync + ef 惰性化 **1813 (+2.9%)** -> Q_in_reg 窗口化 **1841.5** -> **rescale 增长守卫 2115.6 (+14.9%，累计 +20%)**；距 wmma pair 2731 收窄到 **-22.5%**。
+
+**rescale 守卫（本 session 最大单点收益）**：寄存器 O 有 4 份 per-sub 部分和，每份每 tile 都要 128 FMA/lane 的在线 rescale（wmma 的 smem O 只 rescale 一次且 256 线程分担 -> 我们这里结构性 x4 冗余）。但 rescale 仅在**行运行最大值增长**时才非恒等，`grew |= sn[r] > old_max` 守卫后（均匀分支，全 lane 同源推导）真实负载下绝大多数 tile 直接跳过。这类"寄存器驻留换来的集中式代价"是后续继续挖的方向。
+
+（已归档：swizzle 1762 / sync+ef 1813 / Q窗口 1841.5；Q 窗口踩坑：内层步长必须 8 h2，写成 1 会越界读+重复累加 k，曾致 GPU fault）
 
 **性能嫌疑清单（下 session 按序 A/B，probe5/6 保回归）：**
 1. ~~ldmatrix 无 swizzle~~ **已证伪（2026-09-24 swizzle 化实测 1771 -> 1762，噪声内）**：
@@ -593,7 +597,10 @@ mma/ldmatrix PTX 本身按硬件 lane 工作，任意 blockDim 无碍 —— 只
 2. **sn/ef 每 warp 重复计算**：comb 扫描+16 expf x8 warps，且 S-exp 又一遍
    —— 可合并为行主小组内一次（wmma 的 THREADS_PER_ROW 结构天然只算一份）
 3. 每 tile 6 个 sync（wmma pair ~5）+ 寄存器化 O 的 128 fma rescale/tile
-4. ~~Q 每 k-step 重载~~ 已做窗口化（+1.6%）；剩余：全 D 常驻 Q（16 frag=64 regs，可能 spill，
+4. **同类「集中式寄存器代价」**：sn[16] 每 lane 全 16 行的 comb 扫描（64 smem 读 + 48 fmax），
+   可改为 lane i 算一行 + shfl 广播（每 lane 只需其 6 个用到的行：fi 的 2 个 + fj 的 4 个），
+   预期再省 ~150 cyc/lane/tile；grew 可顺带 shfl 归约
+5. ~~Q 每 k-step 重载~~ 已做窗口化（+1.6%）；剩余：全 D 常驻 Q（16 frag=64 regs，可能 spill，
    需实测）、以及**跨 warp softmax（scratch+publish+3 barrier）vs 旧路径列内 warp 组织**
    ——这是与 3054 旧路径最大的结构差异（我们的每 tile 6->5 sync + 两次 scratch 往返，
    旧路径 np-warp 列内 shfl 全在 warp 内、无 smem scratch 无 publish），列为下一个大杠杆

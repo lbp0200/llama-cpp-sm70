@@ -581,6 +581,7 @@ flash_attn_ext_v100_kernel(
         // combined tile max per row, online softmax factors (all lanes read
         // the old row state before warp0 of the group publishes the update)
         float sn[16];
+        bool grew = false;
         for (int r = 0; r < 16; ++r) {
             const int act = m_tile * 16 + r;
             float comb = sScrMax[act * 4 + 0];
@@ -590,8 +591,12 @@ flash_attn_ext_v100_kernel(
             const float old_max = sRowMax[act];
             const float new_max = fmaxf(old_max, comb);
             sn[r] = new_max > -1e30f ? new_max : 0.0f;
+            grew |= sn[r] > old_max;
         }
-        if (block_n > 0) {
+        // The rescale is the identity whenever no row's running max grew
+        // (ef == 1), which is the common case after the first few tiles. The
+        // guard is uniform: every lane derives it from the same 16 smem values.
+        if (block_n > 0 && grew) {
             // ef lazily for this lane's four O rows instead of all16: the
             // O element rows are fj(l) = {c, c+1, 8+c, 9+c}, c = (lane%4)*2
             const int c = (mma_lane % 4) * 2;

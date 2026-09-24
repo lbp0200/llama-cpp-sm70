@@ -11,3 +11,4 @@ Hello, world.
 | gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp4096 |       1813.06 ± 1.17 |
 | gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |            tg32 |        108.05 ± 0.46 |
 # E1+E3+Qwin 2026-09-24T09:19:56Z pp4096=1841.5
+# rescale-guard 2026-09-24T09:38:12Z pp1024=2591.7 pp4096=2115.6 tg32=108.0
