@@ -387,12 +387,38 @@ attention 走 FlashInfer，源未本地化，留待后用）。README 实战提�
 - pp4096 2464 -> **~2697 (+9.4%)**，对旧路径(3054)差距 **-19.1% -> -11.7%**
 - V100 不受影响（Q_PAD/P_PAD 仅 Turing 启用，V100 字节不变；V100 已下线不可复测）
 
-### 下一阶段大杠杆（排序）
-1. **GQA x2 顺序双头 + 寄存器 O**（复用实验 commit 781861f2e 的 REGS 机制）：
-   KV smem 流量/2（pad 系列已证明 smem 流量是 sm75 prefill 主限速），
-   需双头 Q/mask/dst 映射与寄存器预算（BM16 时 32x256/256thr=32f32/t 可行）
-2. 旧路径数据流整体移植（mma.sync + KQ_C，C 级）
-3. FlashInfer 经典 attention 内核研究（需拉源）
+### 下一阶段大杠杆（排序，2026-09-24 中午补充逐字节预算分析）
+
+**路线 A：BN48 + GQA x2 双头 pair + 寄存器 O**（推荐）
+- 动机：pad 系列已证明 smem 流量是 sm75 prefill 主限速；双头共享一次 KV 加载
+  把 KV smem 流量再砍半，是剩余唯一没动过的大流量项
+- 结构：cfg<32(BLOCK_M=行=2头x16tok), BN, 256, REGS_O>；行映射
+  row<16->(head0, start_row+row), row>=16->(head1, start_row+row-16)；
+  grid 按 kv 头成对（gqa=6 -> 3 pair，块数/2）；mask 按 token 行、dst 按头散射；
+  复用 781861f2e 已过 470/470 的 REGS 机制（warp 私有 scratch 版）
+- **预算逐字节（64KB 硬顶，现行 Q8/P8/KV8 pads 计入）**：
+  | 方案 | smem | 判定 |
+  |---|---|---|
+  | BN64 + REGS + warp 私有 8KB scratch | 71.9KB | ✗ 死 |
+  | BN64 + REGS + 4KB 分相 scratch | 67.8KB | ✗ 死 |
+  | BN64 + 全 pad 摘除 + 4KB scratch | 65.8KB | ✗ 差 288B，死 |
+  | **BN48 + REGS + 4KB scratch（pads 保留）** | **56.4KB ✓** | **唯一健康轴** |
+  | BN32 + pair | 预算松 | solo 已证 -10.6%，与 pair 增益对冲净值不明 |
+- 风险：BN48 为未测新轴（QK mma 3x16 n-tile、softmax 48 列通用路径应兼容）；
+  双头映射调试（mask 行=token、dst 按头散射、kv_ceiling 行循环通用）
+- 预期：+5~12%（pp4096 2697 -> 2830~3020，对旧路径 3054 差距 -11.7% -> -1%~+7%）
+
+**路线 B：旧路径数据流整体移植**（mma.sync + KQ_C 寄存器分 + Q_in_reg + ldmatrix swizzle）
+- 直接复制赢家形态（旧路径 sm75 实测 3054），预期逼近 +14%
+- 工作量最大：QK 循环反转（k 外层）、KQ_C 常驻、Volta/Turing mma 操作数布局
+  （fragment 教训在案，动手前先单 warp probe）、seam/fixup 可不需要（单 CTA 版）
+- 多轮次工程，适合作为 A 打平后的下一级
+
+**路线 C：到此为止** —— +9.4% 已落袋（2464->2697）、全绿、已推送，写总结收工
+
+**辅助**：FlashInfer 经典 attention 内核拉源研究（网络 + 阅读成本，可嵌入 A/B 任一线）
+
+**决策状态**：待用户在 A/B/C 中选择（2026-09-24 中午，已向用户呈报）。
 
 ## 2070 回线验证（task-6 已实测，2026-09-24 上午补做）
 
