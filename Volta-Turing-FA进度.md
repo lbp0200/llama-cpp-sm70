@@ -563,6 +563,35 @@ mma/ldmatrix PTX 本身按硬件 lane 工作，任意 blockDim 无碍 —— 只
 - probe6 的价值：纯协议、块级 (32 lanes x 8 warps)、合成分数、CPU 全对照 —— 下次
   继续调试**必须先让 probe6 转绿**再动内核（原子(probe5)与协议(probe6)双绿后合并进内核）
 
+### 路线 B 引擎：正确性全绿、性能 -35%，默认关闭待调优（2026-09-24）
+
+**xor 根因修复后（`x = x OP shfl(x,k)` 组合式）全量验证：**
+- 门禁 470/470、全量 sweep 7747/7747、回退(MMA=0) 470/470、真模型冒烟 Hello world. 全过
+- probe6 修正后 PASS（max 0 bad / sum 0 bad）——双探针（原子 probe5 + 协议 probe6）从此为引擎回归的最小前哨
+
+**A/B（translategemma f16 r3，存档 sm75-优化存档/mma-engine-ab.log）：**
+| | MMA 引擎 | wmma pair | 旧路径 |
+|---|---|---|---|
+| pp1024 | 2387±80 | 2973±108 | 3083 |
+| pp4096 | 1770.6±0.4 | **2730.8±1.2** | 3054 |
+| tg32 | 107.9 | 107.7 | 107.9 |
+
+**结论与状态**：正确但 -35% pp，未达 >=2900 目标；按「不发回归」原则
+`GGML_V100_FA_MMA` 默认改为**显式1才启用**，主干行为保持 wmma pair（2731）。
+两路都进门禁（回退显式 470 过）。
+
+**性能嫌疑清单（下 session 按序 A/B，probe5/6 保回归）：**
+1. **ldmatrix 吃的是「有 pad 无 swizzle」的 smem** —— 旧路径 ldmatrix 全部走
+   fattn-swizzle 的 bytes_rc XOR swizzle（这正是它 swz=true 的原因）；
+   未 swizzle 的 ldmatrix 8x8 象限读在 Turing 上有已知 bank 冲突 —— 头号嫌疑，
+   修复=Q/K/V 装载改 bytes_rc 布局（中等改动，直接对标旧路径同款）
+2. **sn/ef 每 warp 重复计算**：comb 扫描+16 expf x8 warps，且 S-exp 又一遍
+   —— 可合并为行主小组内一次（wmma 的 THREADS_PER_ROW 结构天然只算一份）
+3. 每 tile 6 个 sync（wmma pair ~5）+ 寄存器化 O 的 128 fma rescale/tile
+4. Q 每 k-step 从 smem 重载 x4 warps（Q_in_reg=档案 v2 未走的杠杆）
+5. launch_bounds(256,1) 的寄存器调度差异（wmma 是 (256,2) 编译）
+调优后目标：先 >=2731（超 wmma），再 >=2900（原验收线），tg 保持 108。
+
 **备选（若只要数字）**：pair 形状派发级转调上游 mma 内核（20 行，pp4096 立得 ~3054），
 代价=pair wmma 引擎变成无人执行的死代码、门禁不再覆盖它 -> 不推荐，除非用户明示。
 

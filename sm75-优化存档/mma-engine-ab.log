@@ -1,0 +1,9 @@
+# A/B mma-engine vs wmma-pair 2026-09-24T08:36:39Z
+## MMA engine (default)
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp1024 |      2387.35 ± 80.44 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp4096 |       1770.64 ± 0.42 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |            tg32 |        107.86 ± 0.38 |
+## wmma pair (GGML_V100_FA_MMA=0)
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp1024 |     2973.26 ± 108.24 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp4096 |       2730.75 ± 1.19 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |            tg32 |        107.73 ± 0.27 |

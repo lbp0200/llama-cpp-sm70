@@ -51,10 +51,12 @@ __global__ void probe6(float * out) {
         mx_a = fmaxf(mx_a, S[4]); mx_a = fmaxf(mx_a, S[5]);
         mx_b = fmaxf(mx_b, S[2]); mx_b = fmaxf(mx_b, S[3]);
         mx_b = fmaxf(mx_b, S[6]); mx_b = fmaxf(mx_b, S[7]);
-        mx_a = __shfl_xor_sync(0xffffffffu, mx_a, 1, 32);
-        mx_a = __shfl_xor_sync(0xffffffffu, mx_a, 2, 32);
-        mx_b = __shfl_xor_sync(0xffffffffu, mx_b, 1, 32);
-        mx_b = __shfl_xor_sync(0xffffffffu, mx_b, 2, 32);
+        // combine via xor shuffles: plain assignment would leave lane0 with
+        // only lane3's value (root cause of the engine's missing sums)
+        mx_a = fmaxf(mx_a, __shfl_xor_sync(0xffffffffu, mx_a, 1, 32));
+        mx_a = fmaxf(mx_a, __shfl_xor_sync(0xffffffffu, mx_a, 2, 32));
+        mx_b = fmaxf(mx_b, __shfl_xor_sync(0xffffffffu, mx_b, 1, 32));
+        mx_b = fmaxf(mx_b, __shfl_xor_sync(0xffffffffu, mx_b, 2, 32));
         const int act_a = m_tile * 16 + lane / 4;
         const int act_b = act_a + 8;
         if (lane % 4 == 0) {
@@ -81,10 +83,10 @@ __global__ void probe6(float * out) {
         float sum_a = 0.f, sum_b = 0.f;
         sum_a += S[0] + S[1] + S[4] + S[5];
         sum_b += S[2] + S[3] + S[6] + S[7];
-        sum_a = __shfl_xor_sync(0xffffffffu, sum_a, 1, 32);
-        sum_a = __shfl_xor_sync(0xffffffffu, sum_a, 2, 32);
-        sum_b = __shfl_xor_sync(0xffffffffu, sum_b, 1, 32);
-        sum_b = __shfl_xor_sync(0xffffffffu, sum_b, 2, 32);
+        sum_a += __shfl_xor_sync(0xffffffffu, sum_a, 1, 32);
+        sum_a += __shfl_xor_sync(0xffffffffu, sum_a, 2, 32);
+        sum_b += __shfl_xor_sync(0xffffffffu, sum_b, 1, 32);
+        sum_b += __shfl_xor_sync(0xffffffffu, sum_b, 2, 32);
         if (lane % 4 == 0) {
             scr_sum[act_a * N_SUBS + sub] = sum_a;
             scr_sum[act_b * N_SUBS + sub] = sum_b;

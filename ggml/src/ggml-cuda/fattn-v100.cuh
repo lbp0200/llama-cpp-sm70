@@ -49,22 +49,28 @@ static constexpr int WMMA_M = 16;
 static constexpr int WMMA_N = 16;
 static constexpr int WMMA_K = 16;
 
-// O storage: smem tile (legacy) or one private 16x16 scratch slot per warp
-// (REGS_O). expd lives in the REGS variant only, so the solo layouts keep
-// their exact byte size.
-template <int BM_, bool REGS_O_, int NT_>
+// O storage: smem tile (OREG_SMEM), one private 16x16 scratch slot per warp
+// plus expd (OREG_REGS), or none (OREG_NONE: the mma engine keeps O in
+// registers end to end). expd lives in the REGS variant only, so the solo
+// layouts keep their exact byte size.
+enum oreg_mode { OREG_SMEM = 0, OREG_REGS = 1, OREG_NONE = 2 };
+template <int BM_, int MODE_, int NT_>
 struct ORegion;
 template <int BM_, int NT_>
-struct ORegion<BM_, true, NT_> {
+struct ORegion<BM_, OREG_REGS, NT_> {
     alignas(16) float os[(NT_ / 32) * WMMA_M * WMMA_M];
     alignas(16) float expd[BM_];
 };
 template <int BM_, int NT_>
-struct ORegion<BM_, false, NT_> {
+struct ORegion<BM_, OREG_SMEM, NT_> {
     alignas(16) float o[BM_ * 256];
 };
+template <int BM_, int NT_>
+struct ORegion<BM_, OREG_NONE, NT_> {
+    alignas(16) char none[16];
+};
 
-template <int BLOCK_M_, int BLOCK_N_, int THREADS_PER_BLOCK_, bool REGS_O_ = false, bool PAIR_ = false>
+template <int BLOCK_M_, int BLOCK_N_, int THREADS_PER_BLOCK_, bool REGS_O_ = false, bool PAIR_ = false, bool MMA_ = false>
 struct cfg {
     static constexpr int BLOCK_M = BLOCK_M_;
     static constexpr int BLOCK_N = BLOCK_N_;
@@ -74,6 +80,11 @@ struct cfg {
     // KV tile load serves both. Needs register-resident O to fit 64KB.
     static constexpr bool PAIR = PAIR_;
     static_assert(!PAIR_ || REGS_O_, "pair layout requires register-resident O");
+    // MMA engine (route B): scores/softmax/O in registers, mma+ldmatrix atoms.
+    static constexpr bool MMA = MMA_;
+    static_assert(!MMA_ || PAIR_, "mma engine runs on the pair layout");
+    static_assert(!MMA_ || (BLOCK_M_ == 32 && BLOCK_N_ == 64 && THREADS_PER_BLOCK_ == 256), "mma engine shape");
+    static_assert(!MMA_ || (BLOCK_N_ / 16) == (THREADS_PER_BLOCK_ / 32) / (BLOCK_M_ / 16), "warp/sub bijection");
     // Token rows per block stride: pair advances by one band (BLOCK_M/2).
     static constexpr int ROWS_HALF = PAIR_ ? BLOCK_M_ / 2 : BLOCK_M_;
     static constexpr int WARPS_PER_BLOCK = THREADS_PER_BLOCK / 32;
@@ -110,11 +121,15 @@ struct cfg {
             alignas(16) half k[BLOCK_N * KV_STRIDE];
             alignas(16) half v[BLOCK_N * KV_STRIDE];
         } kv;
-        alignas(16) float s[BLOCK_M * S_STRIDE];
-        alignas(16) half  p[BLOCK_M * P_STRIDE];
-        ORegion<BLOCK_M, REGS_O, THREADS_PER_BLOCK> oreg;
+        alignas(16) float s[BLOCK_M * (MMA_ ? 1 : S_STRIDE)];   // unused by mma
+        alignas(16) half  p[BLOCK_M * (MMA_ ? 1 : P_STRIDE)];   // unused by mma
+        ORegion<BLOCK_M, MMA_ ? OREG_NONE : (REGS_O_ ? OREG_REGS : OREG_SMEM), THREADS_PER_BLOCK> oreg;
         alignas(16) float row_max[BLOCK_M];
         alignas(16) float row_sum[BLOCK_M];
+        // Cross-warp partial row max/sum for the mma engine (one slot per n16
+        // sub). Sized to zero-cost for the wmma configs (solo sits at 65216B).
+        alignas(16) float scratch_max[MMA_ ? BLOCK_M * 4 : 1];
+        alignas(16) float scratch_sum[MMA_ ? BLOCK_M * 4 : 1];
     };
 
     static constexpr size_t SMEM_BYTES = (sizeof(SmemLayout) + 127) & ~size_t(127);
@@ -129,6 +144,9 @@ using cfg_sm75 = cfg<16, 64, 256>;                    // odd-GQA fallback
 // that fits the 64KB cap at this row count:
 // q 16896 + kv 25344 + s 6144 + p 4608 + oreg 8320 + rows 256 = 61664B.
 using cfg_sm75_pair = cfg<32, 48, 256, true, true>;
+// Route B mma engine on the pair layout: BN64 (4 n16 subs x 2 m-tiles = 8
+// warps exactly). s/p/oreg collapse to dummies; smem ~= 52KB.
+using cfg_sm75_pair_mma = cfg<32, 64, 256, true, true, true>;
 
 template <typename CFG>
 __device__ __forceinline__ void init_smem_v100(char * smem_raw) {
@@ -218,6 +236,28 @@ __device__ __forceinline__ void regs_o_rescale(
     }
 }
 
+// ldmatrix for tile<16,8,half2> with lane-relative addressing. mma.cuh's
+// helpers index by raw threadIdx.x and only work in single-warp-wide blocks
+// (upstream kernels launch dim3(32, nwarps)); with blockDim.x=256 every warp
+// but warp0 would read shifted columns. The asm matches mma.cuh verbatim.
+__device__ __forceinline__ void ldm16x8_lane(ggml_cuda_mma::tile<16, 8, half2> & t, const half2 * xs0, const int stride) {
+    const int lane = threadIdx.x & 31;
+    int * xi = (int *) t.x;
+    const int * xs = (const int *) xs0 + (lane % 16) * stride + (lane / 16) * 4;
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+        : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
+        : "l"(xs));
+}
+
+__device__ __forceinline__ void ldm16x8_lane_trans(ggml_cuda_mma::tile<16, 8, half2> & t, const half2 * xs0, const int stride) {
+    const int lane = threadIdx.x & 31;
+    int * xi = (int *) t.x;
+    const int * xs = (const int *) xs0 + (lane % 16) * stride + (lane / 16) * 4;
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.b16 {%0, %1, %2, %3}, [%4];"
+        : "=r"(xi[0]), "=r"(xi[2]), "=r"(xi[1]), "=r"(xi[3])
+        : "l"(xs));
+}
+
 // ---------------------------------------------------------------------------
 // Side kernel: per-query-row visibility ceiling (number of non-masked keys).
 // One block per row; finds the last non -inf column of the f16 mask row. This
@@ -265,7 +305,7 @@ __global__ static void fattn_v100_mask_kvmax_kernel(
 // and walks the full causal KV range in CFG::BLOCK_N chunks.
 // ---------------------------------------------------------------------------
 template <typename CFG>
-__global__ void __launch_bounds__(CFG::THREADS_PER_BLOCK, 2)
+__global__ void __launch_bounds__(CFG::THREADS_PER_BLOCK, CFG::MMA ? 1 : 2)
 flash_attn_ext_v100_kernel(
         const char * __restrict__ Q_ptr,
         const char * __restrict__ K_ptr,
@@ -291,6 +331,12 @@ flash_attn_ext_v100_kernel(
         printf("[v100] ENTER x=%d z=%d\n", blockIdx.x, blockIdx.z);
     }
     const int tid = threadIdx.x;
+    // tile<16,16,float> get_i/get_j hardcode threadIdx.x and are only valid
+    // for single-warp blocks; re-derive them from the lane id (mma.cuh generic
+    // formulas). mma/ldmatrix PTX is lane based and unaffected.
+    const int mma_lane = tid & 31;
+    auto fi = [&](const int l) { return ((l / 2) % 2) * 8 + mma_lane / 4; };
+    auto fj = [&](const int l) { return (l / 4) * 8 + (mma_lane % 4) * 2 + (l % 2); };
 
     const int batch_head_id = blockIdx.x; // head-major launch order: the gqa
                                           // group shares K in L2
@@ -387,21 +433,23 @@ flash_attn_ext_v100_kernel(
     float * sS = smem.s;
     half  * sP = smem.p;
     float * sO = nullptr;
-    if constexpr (!CFG::REGS_O) {
+    if constexpr (!CFG::REGS_O && !CFG::MMA) {
         sO = smem.oreg.o;
     }
     float * sOS = nullptr;
     const float * sExpd = nullptr;
-    if constexpr (CFG::REGS_O) {
+    if constexpr (CFG::REGS_O && !CFG::MMA) {
         sOS = smem.oreg.os;
         sExpd = smem.oreg.expd;
     }
     float * sRowMax = smem.row_max;
     float * sRowSum = smem.row_sum;
+    float * sScrMax = smem.scratch_max;
+    float * sScrSum = smem.scratch_sum;
 
     if (threadIdx.x < CFG::BLOCK_M) {
         sRowMax[threadIdx.x] = CFG::NEG_INF;
-        if constexpr (CFG::REGS_O) {
+        if constexpr (CFG::REGS_O && !CFG::MMA) {
             smem.oreg.expd[threadIdx.x] = 1.0f;
         }
     }
@@ -419,14 +467,156 @@ flash_attn_ext_v100_kernel(
     constexpr int O_TILES_TOTAL = O_TILES_M * O_TILES_D;
     constexpr int O_TILES_PER_WARP = (O_TILES_TOTAL + CFG::WARPS_PER_BLOCK - 1) / CFG::WARPS_PER_BLOCK;
     fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> o_frag[O_TILES_PER_WARP];
-    if constexpr (CFG::REGS_O) {
+    if constexpr (CFG::REGS_O && !CFG::MMA) {
 #pragma unroll
         for (int t = 0; t < O_TILES_PER_WARP; ++t) {
             fill_fragment(o_frag[t], 0.0f);
         }
     }
 
+    // Route B mma engine. Warp map: warps split into m-tiles x n16 kv subs
+    // (2 x 4 here, asserted bijection); each warp owns one (m, sub) score
+    // tile and, for its m-tile, O over all of D as 16 d-tiles.
+    constexpr int MMA_WARP_M = CFG::WARPS_PER_BLOCK / (CFG::BLOCK_M / 16);
+    ggml_cuda_mma::tile<16, 16, float> o_mma[16];
+    auto mma_tile_body = [&](const int block_n) {
+        using namespace ggml_cuda_mma;
+        constexpr int N_SUBS = CFG::BLOCK_N / 16;
+        const int w_id = tid / 32;
+        const int lane = mma_lane;
+        const int m_tile = w_id / MMA_WARP_M;
+        const int sub = w_id % MMA_WARP_M;
+        const int start_col = block_n * CFG::BLOCK_N;
+        const int valid_k_rows = min(CFG::BLOCK_N, N - start_col);
+
+        load_kv_f16_to_smem<CFG>(k_base + (int64_t) start_col * stride_K1, stride_K1, sK, valid_k_rows);
+        __syncthreads();
+
+        // QK: S(16 Q rows x 16 kv) = sum over D of Q . K, plain ldmatrix on
+        // both sides from [row][k-fast] tiles (probe5: maxerr 0).
+        tile<16, 16, float> S;
+        for (int l = 0; l < S.ne; ++l) {
+            S.x[l] = 0.f;
+        }
+        const half2 * q_h2 = (const half2 *) sQ + (int) (m_tile * 16 * (CFG::Q_STRIDE / 2));
+        const half2 * k_h2 = (const half2 *) sK + (int) (sub * 16 * (CFG::KV_STRIDE / 2));
+        for (int k0h = 0; k0h < 128; k0h += 8) {
+            tile<16, 8, half2> A;
+            tile<16, 8, half2> B;
+            ldm16x8_lane(A, q_h2 + k0h, CFG::Q_STRIDE / 2);
+            ldm16x8_lane(B, k_h2 + k0h, CFG::KV_STRIDE / 2);
+            mma(S, A, B);
+        }
+
+        // scale + mask straight into the register tile; mask -inf handles kv
+        // columns past valid_k_rows, invalid token rows never touch gmem.
+        for (int l = 0; l < S.ne; ++l) {
+            const int act = m_tile * 16 + fi(l);
+            const int col_in = sub * 16 + fj(l);
+            if (tok_of(act) >= valid_tokens || col_in >= valid_k_rows) {
+                S.x[l] = CFG::NEG_INF;
+            } else {
+                const half mv = __ldg(reinterpret_cast<const half *>(m_base + (int64_t) (start_row + tok_of(act)) * stride_M1) + start_col + col_in);
+                S.x[l] = S.x[l] * scale + __half2float(mv);
+            }
+        }
+
+        // in-warp row max for this sub's 16 kv columns: rows lane/4 and
+        // 8+lane/4, columns assembled by combining xor 1,2 shuffles (a plain
+        // assignment would leave lane0 with only lane3's value - probe6 root
+        // cause of the first engine cut's missing sums).
+        float mx_a = CFG::NEG_INF;
+        float mx_b = CFG::NEG_INF;
+        mx_a = fmaxf(mx_a, S.x[0]); mx_a = fmaxf(mx_a, S.x[1]);
+        mx_a = fmaxf(mx_a, S.x[4]); mx_a = fmaxf(mx_a, S.x[5]);
+        mx_b = fmaxf(mx_b, S.x[2]); mx_b = fmaxf(mx_b, S.x[3]);
+        mx_b = fmaxf(mx_b, S.x[6]); mx_b = fmaxf(mx_b, S.x[7]);
+        mx_a = fmaxf(mx_a, __shfl_xor_sync(0xffffffffu, mx_a, 1, 32));
+        mx_a = fmaxf(mx_a, __shfl_xor_sync(0xffffffffu, mx_a, 2, 32));
+        mx_b = fmaxf(mx_b, __shfl_xor_sync(0xffffffffu, mx_b, 1, 32));
+        mx_b = fmaxf(mx_b, __shfl_xor_sync(0xffffffffu, mx_b, 2, 32));
+        const int act_a = m_tile * 16 + lane / 4;
+        const int act_b = act_a + 8;
+        if (lane % 4 == 0) {
+            sScrMax[act_a * 4 + sub] = mx_a;
+            sScrMax[act_b * 4 + sub] = mx_b;
+        }
+        __syncthreads();
+
+        // combined tile max per row, online softmax factors (all lanes read
+        // the old row state before warp0 of the group publishes the update)
+        float sn[16];
+        float ef[16];
+        for (int r = 0; r < 16; ++r) {
+            const int act = m_tile * 16 + r;
+            float comb = sScrMax[act * 4 + 0];
+            for (int ss = 1; ss < N_SUBS; ++ss) {
+                comb = fmaxf(comb, sScrMax[act * 4 + ss]);
+            }
+            const float old_max = sRowMax[act];
+            const float new_max = fmaxf(old_max, comb);
+            sn[r] = new_max > -1e30f ? new_max : 0.0f;
+            ef[r] = expf(fmaxf(old_max - sn[r], -80.0f));
+        }
+        if (block_n > 0) {
+            for (int t = 0; t < 16; ++t) {
+                for (int l = 0; l < 8; ++l) {
+                    o_mma[t].x[l] *= ef[fj(l)];
+                }
+            }
+        }
+        for (int l = 0; l < S.ne; ++l) {
+            S.x[l] = expf(fmaxf(S.x[l] - sn[fi(l)], -80.0f));
+        }
+
+        // partial row sums for this sub -> cross-warp combine
+        float sum_a = 0.f;
+        float sum_b = 0.f;
+        sum_a += S.x[0] + S.x[1] + S.x[4] + S.x[5];
+        sum_b += S.x[2] + S.x[3] + S.x[6] + S.x[7];
+        sum_a += __shfl_xor_sync(0xffffffffu, sum_a, 1, 32);
+        sum_a += __shfl_xor_sync(0xffffffffu, sum_a, 2, 32);
+        sum_b += __shfl_xor_sync(0xffffffffu, sum_b, 1, 32);
+        sum_b += __shfl_xor_sync(0xffffffffu, sum_b, 2, 32);
+        if (lane % 4 == 0) {
+            sScrSum[act_a * 4 + sub] = sum_a;
+            sScrSum[act_b * 4 + sub] = sum_b;
+        }
+        __syncthreads();
+        if (w_id % MMA_WARP_M == 0 && lane % 4 == 0) {
+            for (int r = 0; r < 16; ++r) {
+                const int act = m_tile * 16 + r;
+                float tot = 0.f;
+                for (int ss = 0; ss < N_SUBS; ++ss) {
+                    tot += sScrSum[act * 4 + ss];
+                }
+                sRowSum[act] = ef[r] * sRowSum[act] + tot;
+                sRowMax[act] = sn[r];
+            }
+        }
+        __syncthreads();
+
+        // PV: V into the union slot (S stays in registers), P = get_half2(S),
+        // O[d-tile] += V . P (probe5: maxerr 0, i=d j=Q layout).
+        load_kv_f16_to_smem<CFG>(v_base + (int64_t) start_col * stride_V1, stride_V1, sV, valid_k_rows);
+        __syncthreads();
+        {
+            tile<16, 8, half2> B = get_half2(S);
+            const half2 * v_h2 = (const half2 *) sV + (int) (sub * 16 * (CFG::KV_STRIDE / 2));
+            for (int dq = 0; dq < 16; ++dq) {
+                tile<16, 8, half2> A;
+                ldm16x8_lane_trans(A, v_h2 + dq * 8, CFG::KV_STRIDE / 2);
+                mma(o_mma[dq], A, B);
+            }
+        }
+        __syncthreads(); // next tile overwrites the K/V union
+    };
+
     for (int block_n = 0; block_n < num_n_tiles; ++block_n) {
+        if constexpr (CFG::MMA) {
+            mma_tile_body(block_n);
+            continue;
+        }
         const int start_col = block_n * CFG::BLOCK_N;
         const int valid_k_rows = min(CFG::BLOCK_N, N - start_col);
 
@@ -615,7 +805,7 @@ flash_attn_ext_v100_kernel(
                 if (thread_in_row == 0) {
                     sRowSum[row] = exp_diff * sRowSum[row] + row_sum;
                     sRowMax[row] = new_max;
-                    if constexpr (CFG::REGS_O) {
+                    if constexpr (CFG::REGS_O && !CFG::MMA) {
                         smem.oreg.expd[row] = exp_diff;
                     }
                 }
@@ -715,9 +905,54 @@ flash_attn_ext_v100_kernel(
         }
     }
 
+    if constexpr (CFG::MMA) {
+        if (debug_out != nullptr && debug && tid == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+            debug_out[50] = sRowMax[0];
+            debug_out[51] = sRowSum[0];
+            debug_out[60] = sRowMax[1];
+            debug_out[61] = sRowSum[1];
+            for (int c = 0; c < 4; ++c) {
+                debug_out[52 + c] = o_mma[0].x[c];
+                debug_out[64 + c] = o_mma[8].x[c];
+            }
+        }
+    }
+
     // Sinks: an extra no-V softmax term per head. Same math as the VEC kernels:
     // max/sum absorb exp(sink), and the accumulated O is rescaled by exp_diff.
-    if (sinks_ptr != nullptr) {
+    if constexpr (CFG::MMA) {
+        // mma engine: row state read by every warp of the group, published by
+        // warp0 after the barrier so no read races the write; O lives in
+        // o_mma and is scaled in place.
+        if (sinks_ptr != nullptr) {
+            const int w_id = tid / 32;
+            const int m_tile = w_id / MMA_WARP_M;
+            float ed[16];
+            float nv[16];
+            for (int r = 0; r < 16; ++r) {
+                const int act = m_tile * 16 + r;
+                const float sink = sinks_ptr[q_head_id + band_of(act)];
+                const float old_max = sRowMax[act];
+                nv[r] = fmaxf(old_max, sink);
+                ed[r] = expf(old_max - nv[r]);
+            }
+            __syncthreads();
+            if (w_id % MMA_WARP_M == 0 && mma_lane % 4 == 0) {
+                for (int r = 0; r < 16; ++r) {
+                    const int act = m_tile * 16 + r;
+                    const float sink = sinks_ptr[q_head_id + band_of(act)];
+                    sRowSum[act] = ed[r] * sRowSum[act] + expf(sink - nv[r]);
+                    sRowMax[act] = nv[r];
+                }
+            }
+            for (int t = 0; t < 16; ++t) {
+                for (int l = 0; l < 8; ++l) {
+                    o_mma[t].x[l] *= ed[fj(l)];
+                }
+            }
+            __syncthreads();
+        }
+    } else if (sinks_ptr != nullptr) {
         for (int c = tid; c < n_row_groups; c += CFG::THREADS_PER_BLOCK) {
             const int row = act_row(c);
             const float sink = sinks_ptr[q_head_id + band_of(row)];
@@ -726,7 +961,7 @@ flash_attn_ext_v100_kernel(
             const float exp_diff = expf(old_max - new_max);
             sRowSum[row] = exp_diff * sRowSum[row] + expf(sink - new_max);
             sRowMax[row] = new_max;
-            if constexpr (CFG::REGS_O) {
+            if constexpr (CFG::REGS_O && !CFG::MMA) {
                 smem.oreg.expd[row] = exp_diff;
             } else {
                 float * sO_row = sO + row * CFG::O_STRIDE;
@@ -741,7 +976,7 @@ flash_attn_ext_v100_kernel(
             }
         }
         __syncthreads();
-        if constexpr (CFG::REGS_O) {
+        if constexpr (CFG::REGS_O && !CFG::MMA) {
             regs_o_rescale<CFG>(o_frag, sOS, sExpd);
         }
     }
@@ -754,7 +989,35 @@ flash_attn_ext_v100_kernel(
             debug_out[52 + c] = sO != nullptr ? sO[c] : (sOS != nullptr ? sOS[c] : 0.0f);
         }
     }
-    if constexpr (CFG::REGS_O) {
+    if constexpr (CFG::MMA) {
+        // Per-sub normalized scatter: sub0 assigns dst, subs 1..N-1 add, one
+        // barrier per phase so the four partials sum in place.
+        const int w_id = tid / 32;
+        const int m_tile = w_id / MMA_WARP_M;
+        const int sub = w_id % MMA_WARP_M;
+        for (int r = 0; r < MMA_WARP_M; ++r) {
+            if (sub == r) {
+                for (int t = 0; t < 16; ++t) {
+                    for (int l = 0; l < 8; ++l) {
+                        const int act = m_tile * 16 + fj(l);
+                        if (tok_of(act) < valid_tokens) {
+                            const int d = t * 16 + fi(l);
+                            const float v = o_mma[t].x[l] * (1.0f / fmaxf(sRowSum[act], 1e-24f));
+                            float * dp = reinterpret_cast<float *>(d_base
+                                + (int64_t) (start_row + tok_of(act)) * stride_D2
+                                + (int64_t) (q_head_id + band_of(act)) * stride_D1) + d;
+                            if (r == 0) {
+                                *dp = v;
+                            } else {
+                                *dp += v;
+                            }
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    } else if constexpr (CFG::REGS_O) {
         // Each warp normalizes its fragments through its private scratch slot
         // and writes its dst cells directly: no shared state, no barriers.
         const int warp_id_f = tid / 32;
@@ -785,7 +1048,7 @@ flash_attn_ext_v100_kernel(
     for (int i = tid; i < total_f32x4; i += CFG::THREADS_PER_BLOCK) {
         const int row = act_row(i / (D / 4));
         const int col = (i - (i / (D / 4)) * (D / 4)) * 4;
-        if constexpr (CFG::REGS_O) {
+        if constexpr (CFG::MMA || CFG::REGS_O) {
             continue;
         }
         const float sum_clamped = fmaxf(sRowSum[row], 1e-24f);
@@ -1014,7 +1277,19 @@ static void ggml_cuda_flash_attn_ext_v100(ggml_backend_cuda_context & ctx, ggml_
         // Pair pays off on prefill (KV streams and block setup per KV head
         // halved). Decode-sized M measured -2.1% tg, so small M stays solo.
         if (gqa >= 2 && gqa % 2 == 0 && M >= 128) {
-            ggml_cuda_flash_attn_ext_v100_launch<cfg_sm75_pair>(ctx, dst);
+            // Route B mma engine is correct but measured -35% pp4096 vs the
+            // wmma pair path (1771 vs 2731): opt in with GGML_V100_FA_MMA=1
+            // until the perf work in Volta-Turing-FA进度.md lands. Default is
+            // the wmma pair path.
+            static const bool mma_engine = [] {
+                const char * e = getenv("GGML_V100_FA_MMA");
+                return e && e[0] == '1';
+            }();
+            if (mma_engine) {
+                ggml_cuda_flash_attn_ext_v100_launch<cfg_sm75_pair_mma>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_v100_launch<cfg_sm75_pair>(ctx, dst);
+            }
         } else {
             ggml_cuda_flash_attn_ext_v100_launch<cfg_sm75>(ctx, dst);
         }
