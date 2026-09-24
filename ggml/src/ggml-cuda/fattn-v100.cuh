@@ -49,13 +49,35 @@ static constexpr int WMMA_M = 16;
 static constexpr int WMMA_N = 16;
 static constexpr int WMMA_K = 16;
 
-template <int BLOCK_M_, int BLOCK_N_, int THREADS_PER_BLOCK_>
+// O storage: smem tile (legacy) or one private 16x16 scratch slot per warp
+// (REGS_O). expd lives in the REGS variant only, so the solo layouts keep
+// their exact byte size.
+template <int BM_, bool REGS_O_, int NT_>
+struct ORegion;
+template <int BM_, int NT_>
+struct ORegion<BM_, true, NT_> {
+    alignas(16) float os[(NT_ / 32) * WMMA_M * WMMA_M];
+    alignas(16) float expd[BM_];
+};
+template <int BM_, int NT_>
+struct ORegion<BM_, false, NT_> {
+    alignas(16) float o[BM_ * 256];
+};
+
+template <int BLOCK_M_, int BLOCK_N_, int THREADS_PER_BLOCK_, bool REGS_O_ = false, bool PAIR_ = false>
 struct cfg {
     static constexpr int BLOCK_M = BLOCK_M_;
     static constexpr int BLOCK_N = BLOCK_N_;
     static constexpr int THREADS_PER_BLOCK = THREADS_PER_BLOCK_;
+    static constexpr bool REGS_O = REGS_O_;
+    // Pair layout: BLOCK_M rows hold two q heads (two head bands), so one
+    // KV tile load serves both. Needs register-resident O to fit 64KB.
+    static constexpr bool PAIR = PAIR_;
+    static_assert(!PAIR_ || REGS_O_, "pair layout requires register-resident O");
+    // Token rows per block stride: pair advances by one band (BLOCK_M/2).
+    static constexpr int ROWS_HALF = PAIR_ ? BLOCK_M_ / 2 : BLOCK_M_;
     static constexpr int WARPS_PER_BLOCK = THREADS_PER_BLOCK / 32;
-    // THREADS_PER_ROW = THREADS_PER_BLOCK / BLOCK_M: 512/32 = 16 and 256/16 = 16.
+    // THREADS_PER_ROW: solo 512/32 = 16, 256/16 = 16; pair 256/32 = 8.
     static constexpr int THREADS_PER_ROW = THREADS_PER_BLOCK / BLOCK_M;
     static constexpr int P_SUB_TILE = 64; // softmax sub-tile = full BN (one pass per tile)
 
@@ -90,7 +112,7 @@ struct cfg {
         } kv;
         alignas(16) float s[BLOCK_M * S_STRIDE];
         alignas(16) half  p[BLOCK_M * P_STRIDE];
-        alignas(16) float o[BLOCK_M * O_STRIDE];
+        ORegion<BLOCK_M, REGS_O, THREADS_PER_BLOCK> oreg;
         alignas(16) float row_max[BLOCK_M];
         alignas(16) float row_sum[BLOCK_M];
     };
@@ -100,7 +122,13 @@ struct cfg {
 
 // V100 (GV100, 96KB smem/block) and SM75 (TU116/TU106, 64KB smem/block) configs.
 using cfg_v100 = cfg<32, 64, 512>;
-using cfg_sm75 = cfg<16, 64, 256>;
+using cfg_sm75 = cfg<16, 64, 256>;                    // odd-GQA fallback
+// GQA x2 pair on Turing: BLOCK_M=32 rows = 2 q heads x 16 tokens, one KV
+// tile load for both heads (halves KV smem streams and the block count).
+// BN48: a multiple of WMMA_N=16 (3 n-tiles) and the largest such BLOCK_N
+// that fits the 64KB cap at this row count:
+// q 16896 + kv 25344 + s 6144 + p 4608 + oreg 8320 + rows 256 = 61664B.
+using cfg_sm75_pair = cfg<32, 48, 256, true, true>;
 
 template <typename CFG>
 __device__ __forceinline__ void init_smem_v100(char * smem_raw) {
@@ -160,6 +188,33 @@ __device__ __forceinline__ void load_kv_f16_to_smem(
             val = __ldg(&kv_vec[row * row_stride_u4 + vec]);
         }
         sKV_vec[row * (CFG::KV_STRIDE / PER_UINT4) + vec] = val;
+    }
+}
+
+// REGS_O: apply this softmax step's exp_diff to the warp's resident O
+// fragments. Each warp round-trips its fragments one by one through its own
+// 16x16 scratch slot: no cross-warp state, so no barriers at all. sExpd is
+// written before the syncthreads that precedes this call.
+template <typename CFG, int N_FRAG>
+__device__ __forceinline__ void regs_o_rescale(
+        fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> (&o_frag)[N_FRAG],
+        float * __restrict__ sOS, const float * __restrict__ sExpd) {
+    constexpr int O_TILES_D = 256 / WMMA_N;
+    constexpr int TPV = ((CFG::BLOCK_M / WMMA_M) * O_TILES_D + CFG::WARPS_PER_BLOCK - 1) / CFG::WARPS_PER_BLOCK;
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x - warp_id * 32;
+    float * scr = sOS + warp_id * (WMMA_M * WMMA_M);
+#pragma unroll
+    for (int t = 0; t < N_FRAG; ++t) {
+        const int tm = (warp_id * TPV + t) / O_TILES_D;
+        store_matrix_sync(scr, o_frag[t], WMMA_M, mem_row_major);
+        for (int i = lane; i < WMMA_M * WMMA_M; i += 32) {
+            const float f = sExpd[tm * WMMA_M + i / WMMA_M];
+            if (f != 1.0f) {
+                scr[i] *= f;
+            }
+        }
+        load_matrix_sync(o_frag[t], scr, WMMA_M, mem_row_major);
     }
 }
 
@@ -242,11 +297,13 @@ flash_attn_ext_v100_kernel(
     if (false && debug) {
         return; // DEBUG probe disabled
     }
-    if (batch_head_id >= H) {
+    const int head_slots = CFG::PAIR ? H / 2 : H;
+    if (batch_head_id >= head_slots) {
         return;
     }
     const int batch_id = batch_head_id / H;
-    const int q_head_id = batch_head_id - batch_id * H;
+    // Pair: this block owns q heads (x*2, x*2+1) of the same kv group.
+    const int q_head_id = CFG::PAIR ? batch_head_id * 2 : batch_head_id - batch_id * H;
     const int kv_group_size = H / H_KV;
     if (debug && threadIdx.x == 0 && blockIdx.x == 0) {
         printf("[v100] H=%d H_KV=%d gqa=%d N=%d M=%d x=%d z=%d\n",
@@ -257,12 +314,20 @@ flash_attn_ext_v100_kernel(
     }
     const int kv_head_id = q_head_id / kv_group_size;
 
-    const int start_row = blockIdx.y * CFG::BLOCK_M;
+    const int start_row = blockIdx.y * CFG::ROWS_HALF; // pair advances one band
     if (start_row >= M) {
         return;
     }
 
-    const int valid_q_rows = min(CFG::BLOCK_M, M - start_row);
+    const int rows_half = CFG::ROWS_HALF;
+    const int valid_tokens = min(rows_half, M - start_row);
+    // Pair rows = two head bands of the same tokens: [0,rows_half) = head0,
+    // [rows_half,BLOCK_M) = head1. Loops run in compact space [0,n_row_groups)
+    // and expand through act_row(); solo keeps rows == tokens.
+    const int n_row_groups = CFG::PAIR ? 2 * valid_tokens : valid_tokens;
+    auto act_row  = [&](int c) { return c < valid_tokens ? c : rows_half + (c - valid_tokens); };
+    auto band_of  = [&](int act) { return (CFG::PAIR && act >= rows_half) ? 1 : 0; };
+    auto tok_of   = [&](int act) { return act - band_of(act) * rows_half; };
 
     // v2: block-level visibility ceiling from a precomputed kv_max array. Take
     // the MAX over this block's rows: only columns every row masks out are
@@ -273,8 +338,8 @@ flash_attn_ext_v100_kernel(
     int kv_ceiling = -1;
     if (kv_max != nullptr) {
         kv_ceiling = 0;
-        for (int r = 0; r < valid_q_rows; ++r) {
-            kv_ceiling = max(kv_ceiling, kv_max[start_row + r]);
+        for (int t = 0; t < valid_tokens; ++t) {
+            kv_ceiling = max(kv_ceiling, kv_max[start_row + t]);
         }
     }
     if (kv_ceiling >= 0) {
@@ -300,13 +365,13 @@ flash_attn_ext_v100_kernel(
     char *       d_base = dst_ptr + stride_D3 * batch_id;
     if (kv_ceiling == 0) {
         // no visible key for any row in this block: zero the output and return
-        const int n4 = valid_q_rows * (D / 4);
+        const int n4 = n_row_groups * (D / 4);
         for (int i = tid; i < n4; i += CFG::THREADS_PER_BLOCK) {
-            const int row = i / (D / 4);
-            const int col = (i - row * (D / 4)) * 4;
+            const int row = act_row(i / (D / 4));
+            const int col = (i - (i / (D / 4)) * (D / 4)) * 4;
             *reinterpret_cast<float4 *>(d_base
-                + (int64_t) (start_row + row) * stride_D2
-                + (int64_t) q_head_id * stride_D1
+                + (int64_t) (start_row + tok_of(row)) * stride_D2
+                + (int64_t) (q_head_id + band_of(row)) * stride_D1
                 + (int64_t) col * sizeof(float)) = make_float4(0.f, 0.f, 0.f, 0.f);
         }
         return;
@@ -321,16 +386,45 @@ flash_attn_ext_v100_kernel(
     half  * sV = smem.kv.v;
     float * sS = smem.s;
     half  * sP = smem.p;
-    float * sO = smem.o;
+    float * sO = nullptr;
+    if constexpr (!CFG::REGS_O) {
+        sO = smem.oreg.o;
+    }
+    float * sOS = nullptr;
+    const float * sExpd = nullptr;
+    if constexpr (CFG::REGS_O) {
+        sOS = smem.oreg.os;
+        sExpd = smem.oreg.expd;
+    }
     float * sRowMax = smem.row_max;
     float * sRowSum = smem.row_sum;
 
     if (threadIdx.x < CFG::BLOCK_M) {
         sRowMax[threadIdx.x] = CFG::NEG_INF;
+        if constexpr (CFG::REGS_O) {
+            smem.oreg.expd[threadIdx.x] = 1.0f;
+        }
     }
 
-    load_q_f32_to_smem<CFG>(q_base + (int64_t) start_row * stride_Q1, stride_Q1, sQ, valid_q_rows);
+    load_q_f32_to_smem<CFG>(q_base + (int64_t) start_row * stride_Q1, stride_Q1, sQ, valid_tokens);
+    if constexpr (CFG::PAIR) {
+        load_q_f32_to_smem<CFG>(q_base + stride_Q2 + (int64_t) start_row * stride_Q1,
+            stride_Q1, sQ + rows_half * CFG::Q_STRIDE, valid_tokens);
+    }
     __syncthreads();
+
+    // REGS_O: per-warp O accumulator tiles, resident across the whole KV loop.
+    constexpr int O_TILES_M = CFG::BLOCK_M / WMMA_M;
+    constexpr int O_TILES_D = 256 / WMMA_N;
+    constexpr int O_TILES_TOTAL = O_TILES_M * O_TILES_D;
+    constexpr int O_TILES_PER_WARP = (O_TILES_TOTAL + CFG::WARPS_PER_BLOCK - 1) / CFG::WARPS_PER_BLOCK;
+    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> o_frag[O_TILES_PER_WARP];
+    if constexpr (CFG::REGS_O) {
+#pragma unroll
+        for (int t = 0; t < O_TILES_PER_WARP; ++t) {
+            fill_fragment(o_frag[t], 0.0f);
+        }
+    }
 
     for (int block_n = 0; block_n < num_n_tiles; ++block_n) {
         const int start_col = block_n * CFG::BLOCK_N;
@@ -360,7 +454,10 @@ flash_attn_ext_v100_kernel(
             const int tile_n_idx = global_tile_idx - tile_m_idx * num_tiles_n_qk;
             const int tile_m = tile_m_idx * WMMA_M;
             const int tile_n = tile_n_idx * WMMA_N;
-            if (tile_m >= valid_q_rows || tile_n >= valid_k_rows) {
+            // Pair: m-tiles align with head bands, any valid token activates
+            // both band tiles (garbage rows are never read back).
+            const bool tile_rows_ok = CFG::PAIR ? (valid_tokens > 0) : (tile_m < valid_tokens);
+            if (!tile_rows_ok || tile_n >= valid_k_rows) {
                 continue;
             }
 
@@ -390,10 +487,10 @@ flash_attn_ext_v100_kernel(
         __syncthreads();
 
         // Scale + mask by explicit (row, col), architecture independent.
-        for (int i = tid; i < valid_q_rows * CFG::BLOCK_N; i += CFG::THREADS_PER_BLOCK) {
-            const int row = i / CFG::BLOCK_N;
-            const int col = i - row * CFG::BLOCK_N;
-            const int global_m = start_row + row;
+        for (int i = tid; i < n_row_groups * CFG::BLOCK_N; i += CFG::THREADS_PER_BLOCK) {
+            const int row = act_row(i / CFG::BLOCK_N);
+            const int col = i - (i / CFG::BLOCK_N) * CFG::BLOCK_N;
+            const int global_m = start_row + tok_of(row);
             const int global_n = start_col + col;
             float v;
             if (global_n < start_col + valid_k_rows) {
@@ -419,7 +516,7 @@ flash_attn_ext_v100_kernel(
                 debug_out[4] = (float) N;
                 debug_out[5] = (float) M;
                 debug_out[6] = (float) start_row;
-                debug_out[7] = (float) valid_q_rows;
+                debug_out[7] = (float) n_row_groups;
                 for (int cc = 0; cc < 4; ++cc) {
                     debug_out[96 + cc] = __half2float(__ldg(reinterpret_cast<const half *>(m_base + (int64_t) 0 * stride_M1) + cc)); // direct mask[0][cc]
                 }
@@ -438,11 +535,12 @@ flash_attn_ext_v100_kernel(
         for (int sub_start = 0; sub_start < valid_k_rows; sub_start += p_tile_capacity) {
             const int sub_valid_k_rows = min(p_tile_capacity, valid_k_rows - sub_start);
 
-            if (tid < valid_q_rows * CFG::THREADS_PER_ROW) {
-                const int row = tid / CFG::THREADS_PER_ROW;
-                const int thread_in_row = tid - row * CFG::THREADS_PER_ROW;
+            if (tid < n_row_groups * CFG::THREADS_PER_ROW) {
+                const int compact = tid / CFG::THREADS_PER_ROW;
+                const int row = act_row(compact);
+                const int thread_in_row = tid - compact * CFG::THREADS_PER_ROW;
                 const unsigned sync_mask =
-                    (valid_q_rows == CFG::BLOCK_M) ? 0xFFFFFFFFU : __activemask();
+                    (n_row_groups == CFG::BLOCK_M) ? 0xFFFFFFFFU : __activemask();
                 const int row_leader = __ffs(sync_mask) - 1;
 
                 float * sS_row_f = sS + row * CFG::S_STRIDE + sub_start;
@@ -517,6 +615,9 @@ flash_attn_ext_v100_kernel(
                 if (thread_in_row == 0) {
                     sRowSum[row] = exp_diff * sRowSum[row] + row_sum;
                     sRowMax[row] = new_max;
+                    if constexpr (CFG::REGS_O) {
+                        smem.oreg.expd[row] = exp_diff;
+                    }
                 }
 
                 h2_idx = 0;
@@ -540,7 +641,7 @@ flash_attn_ext_v100_kernel(
                     }
                 }
 
-                if (block_n > 0 || sub_start > 0) {
+                if constexpr (!CFG::REGS_O) if (block_n > 0 || sub_start > 0) {
                     float * sO_row = sO + row * CFG::O_STRIDE;
                     float4 * sO_vec = reinterpret_cast<float4 *>(sO_row);
                     const int o_vec_count = (CFG::O_STRIDE + 3) >> 2;
@@ -556,6 +657,11 @@ flash_attn_ext_v100_kernel(
                 }
             }
             __syncthreads();
+            if constexpr (CFG::REGS_O) {
+                if (block_n > 0 || sub_start > 0) {
+                    regs_o_rescale<CFG>(o_frag, sOS, sExpd);
+                }
+            }
             if (debug_out != nullptr && debug && threadIdx.x == 0 && blockIdx.z == 1 && blockIdx.x == 0) {
                 for (int c = 0; c < 8; ++c) {
                     debug_out[40 + c] = __half2float(sP[c]);
@@ -575,7 +681,7 @@ flash_attn_ext_v100_kernel(
                 const int tile_d_idx = global_tile_idx - tile_m_idx * num_tiles_d_pv;
                 const int tile_m = tile_m_idx * WMMA_M;
                 const int tile_d = tile_d_idx * WMMA_N;
-                if (tile_m >= valid_q_rows) {
+                if (!(CFG::PAIR ? valid_tokens > 0 : tile_m < valid_tokens)) {
                     continue;
                 }
 
@@ -583,7 +689,9 @@ flash_attn_ext_v100_kernel(
                 fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, row_major> b_frag;
                 fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
 
-                load_matrix_sync(acc_frag, sO + tile_m * CFG::O_STRIDE + tile_d, CFG::O_STRIDE, mem_row_major);
+                if constexpr (!CFG::REGS_O) {
+                    load_matrix_sync(acc_frag, sO + tile_m * CFG::O_STRIDE + tile_d, CFG::O_STRIDE, mem_row_major);
+                }
 
 #pragma unroll
                 for (int tile_k = 0; tile_k < num_tiles_k_pv; ++tile_k) {
@@ -593,9 +701,15 @@ flash_attn_ext_v100_kernel(
                     }
                     load_matrix_sync(a_frag, sP + tile_m * CFG::P_STRIDE + k_off, CFG::P_STRIDE);
                     load_matrix_sync(b_frag, sV + (sub_start + k_off) * CFG::KV_STRIDE + tile_d, CFG::KV_STRIDE);
-                    mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+                    if constexpr (!CFG::REGS_O) {
+                        mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+                    } else {
+                        mma_sync(o_frag[tile_idx], a_frag, b_frag, o_frag[tile_idx]);
+                    }
                 }
-                store_matrix_sync(sO + tile_m * CFG::O_STRIDE + tile_d, acc_frag, CFG::O_STRIDE, mem_row_major);
+                if constexpr (!CFG::REGS_O) {
+                    store_matrix_sync(sO + tile_m * CFG::O_STRIDE + tile_d, acc_frag, CFG::O_STRIDE, mem_row_major);
+                }
             }
             __syncthreads();
         }
@@ -604,24 +718,32 @@ flash_attn_ext_v100_kernel(
     // Sinks: an extra no-V softmax term per head. Same math as the VEC kernels:
     // max/sum absorb exp(sink), and the accumulated O is rescaled by exp_diff.
     if (sinks_ptr != nullptr) {
-        const float sink = sinks_ptr[q_head_id];
-        for (int row = tid; row < valid_q_rows; row += CFG::THREADS_PER_BLOCK) {
+        for (int c = tid; c < n_row_groups; c += CFG::THREADS_PER_BLOCK) {
+            const int row = act_row(c);
+            const float sink = sinks_ptr[q_head_id + band_of(row)];
             const float old_max = sRowMax[row];
             const float new_max = fmaxf(old_max, sink);
             const float exp_diff = expf(old_max - new_max);
             sRowSum[row] = exp_diff * sRowSum[row] + expf(sink - new_max);
             sRowMax[row] = new_max;
-            float * sO_row = sO + row * CFG::O_STRIDE;
-            for (int i = 0; i < CFG::O_STRIDE / 4; ++i) {
-                float4 v = reinterpret_cast<float4 *>(sO_row)[i];
-                v.x *= exp_diff;
-                v.y *= exp_diff;
-                v.z *= exp_diff;
-                v.w *= exp_diff;
-                reinterpret_cast<float4 *>(sO_row)[i] = v;
+            if constexpr (CFG::REGS_O) {
+                smem.oreg.expd[row] = exp_diff;
+            } else {
+                float * sO_row = sO + row * CFG::O_STRIDE;
+                for (int i = 0; i < CFG::O_STRIDE / 4; ++i) {
+                    float4 v = reinterpret_cast<float4 *>(sO_row)[i];
+                    v.x *= exp_diff;
+                    v.y *= exp_diff;
+                    v.z *= exp_diff;
+                    v.w *= exp_diff;
+                    reinterpret_cast<float4 *>(sO_row)[i] = v;
+                }
             }
         }
         __syncthreads();
+        if constexpr (CFG::REGS_O) {
+            regs_o_rescale<CFG>(o_frag, sOS, sExpd);
+        }
     }
 
     // Normalize O by the running row sum and store fp32 output rows.
@@ -629,13 +751,43 @@ flash_attn_ext_v100_kernel(
         debug_out[50] = sRowMax[0];
         debug_out[51] = sRowSum[0];
         for (int c = 0; c < 8; ++c) {
-            debug_out[52 + c] = sO[c];
+            debug_out[52 + c] = sO != nullptr ? sO[c] : (sOS != nullptr ? sOS[c] : 0.0f);
         }
     }
-    const int total_f32x4 = valid_q_rows * (D / 4);
+    if constexpr (CFG::REGS_O) {
+        // Each warp normalizes its fragments through its private scratch slot
+        // and writes its dst cells directly: no shared state, no barriers.
+        const int warp_id_f = tid / 32;
+        const int first_tile = warp_id_f * O_TILES_PER_WARP;
+        float * scr = sOS + warp_id_f * (WMMA_M * WMMA_M);
+#pragma unroll
+        for (int t = 0; t < O_TILES_PER_WARP; ++t) {
+            const int g = first_tile + t;
+            const int tm = g / O_TILES_D;
+            const int td = g - tm * O_TILES_D;
+            store_matrix_sync(scr, o_frag[t], WMMA_M, mem_row_major);
+            for (int i = tid % 32; i < WMMA_M * WMMA_M; i += 32) {
+                const int rloc = i / WMMA_M;
+                const int row = tm * WMMA_M + rloc;
+                if (tok_of(row) < valid_tokens) {
+                    const int cloc = i - rloc * WMMA_M;
+                    const int col = td * WMMA_N + cloc;
+                    const float inv_sum = 1.0f / fmaxf(sRowSum[row], 1e-24f);
+                    *reinterpret_cast<float *>(
+                        d_base + (int64_t) (start_row + tok_of(row)) * stride_D2
+                        + (int64_t) (q_head_id + band_of(row)) * stride_D1
+                        + (int64_t) col * sizeof(float)) = scr[i] * inv_sum;
+                }
+            }
+        }
+    }
+    const int total_f32x4 = n_row_groups * (D / 4);
     for (int i = tid; i < total_f32x4; i += CFG::THREADS_PER_BLOCK) {
-        const int row = i / (D / 4);
-        const int col = (i - row * (D / 4)) * 4;
+        const int row = act_row(i / (D / 4));
+        const int col = (i - (i / (D / 4)) * (D / 4)) * 4;
+        if constexpr (CFG::REGS_O) {
+            continue;
+        }
         const float sum_clamped = fmaxf(sRowSum[row], 1e-24f);
         const float inv_sum = 1.0f / sum_clamped;
         const float * sO_row = sO + row * CFG::O_STRIDE;
@@ -655,7 +807,7 @@ flash_attn_ext_v100_kernel(
             debug_out[76] = (float) stride_D2;
         }
         *reinterpret_cast<float4 *>(
-            d_base + (int64_t) (start_row + row) * stride_D2 + (int64_t) q_head_id * stride_D1 + (int64_t) col * sizeof(float)) = out;
+            d_base + (int64_t) (start_row + tok_of(row)) * stride_D2 + (int64_t) (q_head_id + band_of(row)) * stride_D1 + (int64_t) col * sizeof(float)) = out;
         if (debug_out != nullptr && debug && threadIdx.x == 0 && blockIdx.z == 0 && blockIdx.x == 0 && row == 0) {
             const float4 back = *reinterpret_cast<const float4 *>(
                 d_base + (int64_t) start_row * stride_D2 + (int64_t) q_head_id * stride_D1);
@@ -784,7 +936,8 @@ static void ggml_cuda_flash_attn_ext_v100_launch(ggml_backend_cuda_context & ctx
     }
 
     const dim3 block_dim(CFG::THREADS_PER_BLOCK, 1, 1);
-    const dim3 blocks_num(H, (M + CFG::BLOCK_M - 1) / CFG::BLOCK_M, 1);
+    const int head_slots = CFG::PAIR ? H / 2 : H;
+    const dim3 blocks_num(head_slots, (M + CFG::ROWS_HALF - 1) / CFG::ROWS_HALF, 1);
 
     static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
     if (!shared_memory_limit_raised[id]) {
@@ -856,7 +1009,15 @@ static void ggml_cuda_flash_attn_ext_v100(ggml_backend_cuda_context & ctx, ggml_
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (cc == GGML_CUDA_CC_TURING) {
         using namespace ggml_cuda_fattn_v100;
-        ggml_cuda_flash_attn_ext_v100_launch<cfg_sm75>(ctx, dst);
+        const long gqa = (long) dst->src[0]->ne[2] / (long) dst->src[1]->ne[2];
+        const long M = dst->src[0]->ne[1];
+        // Pair pays off on prefill (KV streams and block setup per KV head
+        // halved). Decode-sized M measured -2.1% tg, so small M stays solo.
+        if (gqa >= 2 && gqa % 2 == 0 && M >= 128) {
+            ggml_cuda_flash_attn_ext_v100_launch<cfg_sm75_pair>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_v100_launch<cfg_sm75>(ctx, dst);
+        }
     } else {
         using namespace ggml_cuda_fattn_v100;
         ggml_cuda_flash_attn_ext_v100_launch<cfg_v100>(ctx, dst);

@@ -1,0 +1,6 @@
+# GQA2-pair+REGS BN48 2026-09-24T05:24:22Z
+  7747/7747 tests passed
+Hello world.
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp1024 |     2991.58 ± 119.65 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp4096 |       2746.98 ± 1.35 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |            tg32 |        105.69 ± 0.52 |

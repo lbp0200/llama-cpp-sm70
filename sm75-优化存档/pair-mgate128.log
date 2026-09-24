@@ -1,0 +1,7 @@
+# GQA2-pair M>=128-gated 2026-09-24T05:33:48Z
+  470/470 tests passed
+  7277/7277 tests passed
+Hello, world.
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp1024 |     2993.84 ± 117.84 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp4096 |       2732.29 ± 1.27 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |            tg32 |        108.08 ± 0.62 |

@@ -1,0 +1,9 @@
+# baseline HEAD cf613e2bb (Q_PAD=0) 2026-09-24T03:51:57Z
+  470/470 tests passed
+  470/470 tests passed
+> Translate to English: Bonjour le monde.
+Hello world.
+--- bench r3 ---
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp1024 |     2872.44 ± 100.10 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp4096 |       2463.93 ± 1.73 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |            tg32 |        108.01 ± 0.45 |

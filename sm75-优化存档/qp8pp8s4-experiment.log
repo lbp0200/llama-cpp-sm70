@@ -1,0 +1,5 @@
+# Q8+P8+S4 pads (sm75) 2026-09-24T04:02:30Z
+  470/470 tests passed
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp1024 |     2989.85 ± 107.51 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp4096 |       2700.60 ± 1.15 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |            tg32 |        108.06 ± 0.45 |

@@ -1,0 +1,5 @@
+# Q8+P8 + sm75 BN32 real 2026-09-24T04:09:46Z
+  470/470 tests passed
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp1024 |     2999.49 ± 114.28 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp4096 |       2701.60 ± 0.60 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |            tg32 |        108.33 ± 0.47 |

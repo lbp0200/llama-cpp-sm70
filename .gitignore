@@ -153,3 +153,7 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# fork: keep the FA benchmark evidence archive versioned
+!sm75-优化存档/*.log
+!sm75-优化存档/*.md
