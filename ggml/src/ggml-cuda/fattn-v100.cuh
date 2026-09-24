@@ -1,4 +1,5 @@
 #pragma once
+#include "fattn-swizzle.cuh"
 // Volta (SM70) / Turing (SM75) flash attention: 1Cat FLASH_ATTN_V100 dataflow
 // ported to ggml.
 //
@@ -97,7 +98,9 @@ struct cfg {
     // Q gets the same row-pitch skew on Turing only (WMMA A-side traffic is
     // larger than K and the 64KB budget has room); V100 stays byte-identical.
     static constexpr int Q_PAD = (THREADS_PER_BLOCK_ >= 512) ? 0 : 8;
-    static constexpr int Q_STRIDE  = 256 + Q_PAD + D256_PAD;
+    // The mma engine routes every ldmatrix through the fattn-swizzle XOR map
+    // (stride 128 h2 is bank aligned, no row pad); wmma keeps the pads.
+    static constexpr int Q_STRIDE  = MMA_ ? 256 : (256 + Q_PAD + D256_PAD);
     // Row-pitch bank skew for the K/V WMMA loads. V100 (96KB smem) can afford
     // +16 halfs; Turing (64KB cap, P_SUB_TILE=64 in the budget) takes +8, which
     // still moves every row start by 4 banks and breaks the 512B alignment.
@@ -105,7 +108,7 @@ struct cfg {
     // aligned or wmma load_matrix_sync faults with "misaligned address"
     // (pad 4 -> 520B pitch crashed; pad 8 -> 528B is fine).
     static constexpr int KV_PAD = (THREADS_PER_BLOCK_ >= 512) ? 16 : 8;
-    static constexpr int KV_STRIDE = 256 + KV_PAD;
+    static constexpr int KV_STRIDE = MMA_ ? 256 : (256 + KV_PAD);
     static constexpr int S_STRIDE  = BLOCK_N + D256_PAD;
     // P: same Turing-only skew (PV A-side loads; 128B row pitch is fully
     // bank-aligned). smem stays at 65216B < 64KB.
@@ -132,6 +135,8 @@ struct cfg {
         alignas(16) float scratch_sum[MMA_ ? BLOCK_M * 4 : 1];
     };
 
+    static_assert(!MMA_ || (Q_STRIDE / 2) % 32 == 0, "swizzled Q stride must be bank aligned in h2");
+    static_assert(!MMA_ || (KV_STRIDE / 2) % 32 == 0, "swizzled KV stride must be bank aligned in h2");
     static constexpr size_t SMEM_BYTES = (sizeof(SmemLayout) + 127) & ~size_t(127);
 };
 
@@ -180,7 +185,13 @@ __device__ __forceinline__ void load_q_f32_to_smem(
         const int vec = idx - row * D_H2;
         if (row < valid_q_rows) {
             const float2 f2 = __ldg(&q_vec[row * row_stride_u2 + vec]);
-            sQ_h2[row * (CFG::Q_STRIDE / 2) + vec] = __floats2half2_rn(f2.x, f2.y);
+            if constexpr (CFG::MMA) {
+                half2 * dst = (half2 *) ((char *) sQ +
+                    ggml_cuda_fattn_smem_swizzle::bytes_rc<CFG::Q_STRIDE / 2>(row, vec));
+                *dst = __floats2half2_rn(f2.x, f2.y);
+            } else {
+                sQ_h2[row * (CFG::Q_STRIDE / 2) + vec] = __floats2half2_rn(f2.x, f2.y);
+            }
         }
     }
 }
@@ -205,7 +216,14 @@ __device__ __forceinline__ void load_kv_f16_to_smem(
         if (row < valid_k_rows) {
             val = __ldg(&kv_vec[row * row_stride_u4 + vec]);
         }
-        sKV_vec[row * (CFG::KV_STRIDE / PER_UINT4) + vec] = val;
+        if constexpr (CFG::MMA) {
+            // one uint4 = 4 half2 columns; the per-row xor keeps it 16B aligned
+            uint4 * dst = (uint4 *) ((char *) sKV +
+                ggml_cuda_fattn_smem_swizzle::bytes_rc<CFG::KV_STRIDE / 2>(row, vec * (PER_UINT4 / 2)));
+            *dst = val;
+        } else {
+            sKV_vec[row * (CFG::KV_STRIDE / PER_UINT4) + vec] = val;
+        }
     }
 }
 
@@ -236,26 +254,35 @@ __device__ __forceinline__ void regs_o_rescale(
     }
 }
 
-// ldmatrix for tile<16,8,half2> with lane-relative addressing. mma.cuh's
-// helpers index by raw threadIdx.x and only work in single-warp-wide blocks
-// (upstream kernels launch dim3(32, nwarps)); with blockDim.x=256 every warp
-// but warp0 would read shifted columns. The asm matches mma.cuh verbatim.
-__device__ __forceinline__ void ldm16x8_lane(ggml_cuda_mma::tile<16, 8, half2> & t, const half2 * xs0, const int stride) {
+// Swizzled ldmatrix for tile<16,8,half2>: fattn-swizzle's bytes_rc XOR map
+// (same one the old path routes every ldmatrix tile through) with lane-based
+// addressing. mma.cuh / fattn-swizzle both index by raw threadIdx.x and only
+// work in single-warp-wide blocks (upstream launches dim3(32, nwarps)); with
+// blockDim.x=256 every warp but warp0 would read shifted columns.
+__device__ __forceinline__ void ldm16x8_swz(ggml_cuda_mma::tile<16, 8, half2> & t,
+        const half2 * base, const int base_row, const int base_col_h2, const int stride_h2) {
     const int lane = threadIdx.x & 31;
+    const int row = base_row + (lane % 16);
+    uint32_t byte_off = (uint32_t) ((row * stride_h2 + base_col_h2 + (lane / 16) * 4) * (int) sizeof(half2));
+    byte_off ^= (uint32_t) ((row & 7) << 4);
     int * xi = (int *) t.x;
-    const int * xs = (const int *) xs0 + (lane % 16) * stride + (lane / 16) * 4;
+    const void * addr = (const char *) base + byte_off;
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
         : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
-        : "l"(xs));
+        : "l"(addr));
 }
 
-__device__ __forceinline__ void ldm16x8_lane_trans(ggml_cuda_mma::tile<16, 8, half2> & t, const half2 * xs0, const int stride) {
+__device__ __forceinline__ void ldm16x8_swz_trans(ggml_cuda_mma::tile<16, 8, half2> & t,
+        const half2 * base, const int base_row, const int base_col_h2, const int stride_h2) {
     const int lane = threadIdx.x & 31;
+    const int row = base_row + (lane % 16);
+    uint32_t byte_off = (uint32_t) ((row * stride_h2 + base_col_h2 + (lane / 16) * 4) * (int) sizeof(half2));
+    byte_off ^= (uint32_t) ((row & 7) << 4);
     int * xi = (int *) t.x;
-    const int * xs = (const int *) xs0 + (lane % 16) * stride + (lane / 16) * 4;
+    const void * addr = (const char *) base + byte_off;
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.b16 {%0, %1, %2, %3}, [%4];"
         : "=r"(xi[0]), "=r"(xi[2]), "=r"(xi[1]), "=r"(xi[3])
-        : "l"(xs));
+        : "l"(addr));
 }
 
 // ---------------------------------------------------------------------------
@@ -498,13 +525,13 @@ flash_attn_ext_v100_kernel(
         for (int l = 0; l < S.ne; ++l) {
             S.x[l] = 0.f;
         }
-        const half2 * q_h2 = (const half2 *) sQ + (int) (m_tile * 16 * (CFG::Q_STRIDE / 2));
-        const half2 * k_h2 = (const half2 *) sK + (int) (sub * 16 * (CFG::KV_STRIDE / 2));
+        const half2 * sQ_h2c = (const half2 *) sQ;
+        const half2 * sK_h2c = (const half2 *) sK;
         for (int k0h = 0; k0h < 128; k0h += 8) {
             tile<16, 8, half2> A;
             tile<16, 8, half2> B;
-            ldm16x8_lane(A, q_h2 + k0h, CFG::Q_STRIDE / 2);
-            ldm16x8_lane(B, k_h2 + k0h, CFG::KV_STRIDE / 2);
+            ldm16x8_swz(A, sQ_h2c, m_tile * 16, k0h, CFG::Q_STRIDE / 2);
+            ldm16x8_swz(B, sK_h2c, sub * 16, k0h, CFG::KV_STRIDE / 2);
             mma(S, A, B);
         }
 
@@ -602,10 +629,10 @@ flash_attn_ext_v100_kernel(
         __syncthreads();
         {
             tile<16, 8, half2> B = get_half2(S);
-            const half2 * v_h2 = (const half2 *) sV + (int) (sub * 16 * (CFG::KV_STRIDE / 2));
+            const half2 * sV_h2c = (const half2 *) sV;
             for (int dq = 0; dq < 16; ++dq) {
                 tile<16, 8, half2> A;
-                ldm16x8_lane_trans(A, v_h2 + dq * 8, CFG::KV_STRIDE / 2);
+                ldm16x8_swz_trans(A, sV_h2c, sub * 16, dq * 8, CFG::KV_STRIDE / 2);
                 mma(o_mma[dq], A, B);
             }
         }

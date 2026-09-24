@@ -581,7 +581,10 @@ mma/ldmatrix PTX 本身按硬件 lane 工作，任意 blockDim 无碍 —— 只
 两路都进门禁（回退显式 470 过）。
 
 **性能嫌疑清单（下 session 按序 A/B，probe5/6 保回归）：**
-1. **ldmatrix 吃的是「有 pad 无 swizzle」的 smem** —— 旧路径 ldmatrix 全部走
+1. ~~ldmatrix 无 swizzle~~ **已证伪（2026-09-24 swizzle 化实测 1771 -> 1762，噪声内）**：
+   swizzle 本身保留（正确、省 smem 1.5KB、对齐旧路径惯例、bytes_rc 写读同图 +
+   lane 版地址），但它不是瓶颈 —— 见 sm75-优化存档/mma-swizzle.log。原嫌疑文本：
+   旧路径 ldmatrix 全走 fattn-swizzle bytes_rc（原 1 号嫌疑，现降级为已做无收益） —— 旧路径 ldmatrix 全部走
    fattn-swizzle 的 bytes_rc XOR swizzle（这正是它 swz=true 的原因）；
    未 swizzle 的 ldmatrix 8x8 象限读在 Turing 上有已知 bank 冲突 —— 头号嫌疑，
    修复=Q/K/V 装载改 bytes_rc 布局（中等改动，直接对标旧路径同款）

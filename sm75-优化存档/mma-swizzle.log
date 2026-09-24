@@ -1,0 +1,8 @@
+# mma+swizzle 2026-09-24T08:50:26Z
+  7747/7747 tests passed
+  470/470 tests passed
+Hello, world.
+## MMA engine + swizzle
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp1024 |      2378.27 ± 81.36 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp4096 |       1761.79 ± 0.55 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |            tg32 |        107.96 ± 0.56 |
