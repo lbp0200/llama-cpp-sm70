@@ -365,19 +365,25 @@ fattn-swizzle 一直就是在干这件事。后续可继续：Q_STRIDE/P_STRIDE 
    nbatch_fa=64 的 rescale 批处理），量化每 tile 指令流差异后再动手；
 2. 或移植 nbatch_fa 分段 CTA + dstk_fixup 部分和（结构性，多轮次）。
 
-## 2070 回线验证（task-6，条件跳过，2026-09-24 07:24 记录）
+## 2070 回线验证（task-6 已实测，2026-09-24 上午补做）
 
-- 07:17:17 窗口过后共 4 次 SSH 探测（07:18:30 一次 + 07:19~07:24 三次，
-  ConnectTimeout 12-15s）全部 `Connection timed out` —— 2070 未回线。
-- 按 task-6 合同条款跳过，不阻塞目标。
-- **回线后手动补做清单**：
-  ```bash
-  cd ~/llama-cpp-sm70 && git pull    # 至 9a2a876d3+
-  ./build/bin/test-backend-ops -o FLASH_ATTN_EXT -p "hsk=256"   # 期望 470/470
-  ./build/bin/llama-cli -m ~/models/translategemma-4b-it.i1-Q4_K_M.gguf \
-      -p "Translate to English: Bonjour le monde." -n 50 --no-jinja  # -> Hello world.
-  ```
+- 2070 重新开机后：仓库 ff 到 `87e2348c7`，**首次构建即抓到 smem 超限真回归**：
+  cfg_sm75 = 66304B > Turing 64KB 上限，`cudaFuncSetAttribute` invalid argument、
+  所有 FA launch abort —— P_SUB_TILE=64 与 KV 行距偏斜叠加所致。
+- 修复 `cf613e2bb`：KV_PAD 按 smem 预算分级（V100 +16 halfs 字节不变、Turing +8
+  halfs 仍破 512B 对齐），cfg_sm75 = 64704B ✓。V100 路径 constexpr 不变，
+  无需在已下线的 7.3 上复测。
+- 修复后合同验证（RTX 2070 / sm_75）：
+  - `FLASH_ATTN_EXT hsk=256` 连跑 2 轮 **470/470, 470/470** ✓
+  - translategemma-4b 冒烟：`Translate... Bonjour le monde.` -> **Hello, world.** ✓
+- 附带 SM75 新杠杆 A/B（translategemma f16, r3，非合同项）：
 
+| | pp1024 | pp4096 | tg32 |
+|---|---|---|---|
+| 新内核 | 2882 | 2471 | **108.1** |
+| 旧路径 | 3083 | 3054 | 107.9 |
+
+  tg 由历史 96.2 追至**持平**；pp4096 差距 -27%级收窄至 **-19%**。
 ## 下一步 TODO（按优先级）
 
 ### T-A. v2 调试（根因定位）
