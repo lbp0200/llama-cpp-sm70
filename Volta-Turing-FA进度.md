@@ -64,8 +64,9 @@ INT8 group-64 KV）。三处直接价值：
   双 PASS 再动内核 —— 历史上这两个探针各抓到一类致命 bug（`ldmatrix`/`get_i` 的裸 `threadIdx.x`
   单 warp 陷阱；xor 归约写成赋值而非组合）
 - 证据落盘：bench 全部 `tee` 进 `sm75-优化存档/` 并随 commit 入库（该目录已加 gitignore 例外）
-- 远程跑脚本：**`scp` 到机器再 `bash /tmp/x.sh </dev/null`**；不要 `ssh 'bash -s' < file` ——
-  `llama-cli` 会吃掉 stdin 里剩余的脚本行（曾整段吞掉 bench，日志只剩 15 行）
+- 远程跑脚本：**`./run-2070.sh <仓库内脚本>`**（先 rsync 同步再在机器上 `bash ... </dev/null`），
+  标准门禁已脚本化：`./run-2070.sh sm75-优化存档/gate-2070.sh`。不要 `scp`（多余）也不要
+  `ssh 'bash -s' < file` —— 后者会被 `llama-cli` 吃掉 stdin 里剩余的脚本行（曾整段吞掉 bench）
 - 对照开关：`GGML_V100_FA_MMA=0`（pair wmma）/ `GGML_V100_FA=0`（上游 mma）随时 A/B
 - ncu 不可用（`ERR_NVGPUCTRPERM`，需 root 改驱动参数并重启）-> 性能问题只能靠 A/B 阶梯二分
 - **代码同步到 2070：`./sync-2070.sh`**（rsync，全树含未提交状态；排除 `build/`、`.pi/`、探针二进制；

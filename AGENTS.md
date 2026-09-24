@@ -60,6 +60,9 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
   pusher, so **the 2070 needs no GitHub credentials and no private key** - do not register
   a key for it or run `git push` there. A stale `~/.ssh/id_rsa` copy may exist on the box;
   nothing in this workflow uses it.
+- **Run repo scripts on the box with `./run-2070.sh <script-in-repo>`** - it syncs, then runs the
+  script there with stdin closed (`llama-cli` otherwise eats the remaining script lines and the log
+  silently ends early). `./run-2070.sh sm75-优化存档/gate-2070.sh` is the standard FATTN gate.
 - The V100 box (192.168.7.3, sm_70, 32 GB) stays the large-model/long-context
   validation environment (Qwen3.8-27B IQ4_XS etc.).
 - Volta/SM75 FA work lives on branch `feature/v100-fa-port`
