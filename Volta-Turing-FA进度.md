@@ -33,7 +33,7 @@
 ## 铁律（每次改动必跑，本文件下半部有全部出处）
 
 - 门禁：`test-backend-ops -o FLASH_ATTN_EXT -p "hsk=256"` -> 470/470（默认路 + `GGML_V100_FA_MMA=1` 两路）
-  \+ sweep `-p "hsk=(64|128|192|256|512|576|640)"` -> 7747/7747 + 冒烟（`llama-cli`）有正常输出
+  ；sweep `-p "hsk=(64|128|192|256|512|576|640)"` -> 7747/7747 + 冒烟（`llama-cli`）有正常输出
 - **探针前置**：引擎类改动先跑 `probe5`（原子：QK/PV 操作数方向）与 `probe6`（跨 warp 行协议），
   双 PASS 再动内核 —— 历史上这两个探针各抓到一类致命 bug（`ldmatrix`/`get_i` 的裸 `threadIdx.x`
   单 warp 陷阱；xor 归约写成赋值而非组合）
