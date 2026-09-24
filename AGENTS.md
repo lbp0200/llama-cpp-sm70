@@ -60,6 +60,9 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
   pusher, so **the 2070 needs no GitHub credentials and no private key** - do not register
   a key for it or run `git push` there. A stale `~/.ssh/id_rsa` copy may exist on the box;
   nothing in this workflow uses it.
+- **On sm_75 the fork FA kernel is opt-in, not the default**: the default dispatch uses upstream's
+  `fattn-mma-f16.cuh`, which is 12-15% faster at pp4096/pp8192 on the 2070. Cover the fork kernel
+  and the engine with `GGML_V100_FA=1` (plus `GGML_V100_FA_MMA=1`) when running the gate.
 - **Run repo scripts on the box with `./run-2070.sh <script-in-repo>`** - it syncs, then runs the
   script there with stdin closed (`llama-cli` otherwise eats the remaining script lines and the log
   silently ends early). `./run-2070.sh sm75-优化存档/gate-2070.sh` is the standard FATTN gate.
@@ -117,6 +120,8 @@ fork's turbo KV family in spirit (both bound KV bytes on Turing-class cards).
 | `GGML_CUDA_FUSE_CHAIN`      | unset    | `0` disables the elementwise chain fusion (SILU/GELU/ADD/MUL/SCALE/CLAMP runs into one kernel, `ggml_cuda_fuse_elem_chain`) |
 | `GGML_CUDA_Q8CACHE`         | unset    | `0` disables the per-graph shared-quantize cache in mmvq (gate and up projections reuse one q8_1 copy of the activation) |
 | `LLAMA_ATTN_ROT_K/V_OVERRIDE` | off   | Optional upstream attention rotation (TurboQuant manages its own rotation) |
+| `GGML_V100_FA`              | V100: on, 2070: off | Fork Volta/Turing FA kernel (`fattn-v100.cuh`). On the 2070 it measured 8-15% slower than upstream's `fattn-mma-f16.cuh` at every prefill length, with the gap growing in context, so sm_75 defaults to the upstream kernel; `=1` / `=0` override either way |
+| `GGML_V100_FA_MMA`          | unset    | Route B mma engine inside the fork FA kernel (needs `GGML_V100_FA=1` as well). Correct but still slower: opt-in research build |
 
 ### Test gates (all must pass before touching quant/backend code)
 

@@ -857,3 +857,24 @@ shell 的 PATH 里，要用绝对路径；grep `flash_attn_ext_v100_kernel` 看�
 
 **待修（建议）**：sm_75 上 fork FA 是**默认启用**的（闸门按 cc 700/750 放行），但它在 2070 上任何 prefill
 长度都更慢 —— 这是默认值陷阱。应收窄为「仅当请求 turbo KV 类型时才走 fork FA，否则回退上游 FA」。
+
+### 默认派发修正：2070 回退上游 `fattn-mma-f16.cuh`（2026-09-24，已入库）
+
+起因：部署 2070 时发现本 fork 的 FA 内核在每个 prefill 长度都更慢。改 `ggml_cuda_flash_attn_ext_v100_enabled(cc)`：
+env `GGML_V100_FA` 一旦显式设置则完全听它；否则默认 `cc == GGML_CUDA_CC_VOLTA`（**V100 保持 fork 内核，
+Turing 回退上游内核**）。这是「默认值修对」，部署 2070 不再需要记着设环境变量。
+
+同一批 job 内的 back-to-back 实测（translategemma-4b，f16 KV，r3）：
+
+| | 默认（上游 mma）| fork FA（`GGML_V100_FA=1`）| 差距 |
+|---|---|---|---|
+| pp1024 | 3084.1 | 2962.9 | -3.9% |
+| pp4096 | **3048.1 ± 9.0** | 2715.4 | **-10.9%** |
+| pp8192 | **2970.9 ± 1.2** | 2577.7 | **-13.2%** |
+| tg32 | 107.16 | 106.79 | -0.3% |
+
+门禁（脚本 `sm75-优化存档/gate-2070.sh` 已改为分路覆盖）：默认路 470/470、`FA=1` 470/470、
+`FA=1 MMA=1` 470/470、sweep（fork FA）7747/7747；**turbo3 KV 冒烟走默认派发输出 "Hello, world."**
+—— 证明关掉 fork FA 后 TurboQuant 的 turbo KV 在 sm_75 上仍可用（上游自带 turbo FA 路径）。
+
+`GGML_V100_FA_MMA=1` 现在必须配合 `GGML_V100_FA=1`（否则 Turing 上根本进不到 fork 内核）。

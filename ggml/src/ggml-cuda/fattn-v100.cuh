@@ -1166,12 +1166,20 @@ flash_attn_ext_v100_kernel(
 // ---------------------------------------------------------------------------
 // Host dispatch gate + launcher.
 // ---------------------------------------------------------------------------
-static bool ggml_cuda_flash_attn_ext_v100_enabled() {
-    static const bool v = [] {
+static bool ggml_cuda_flash_attn_ext_v100_enabled(const int cc) {
+    // GGML_V100_FA overrides both ways; it is read once because it cannot
+    // change while the process runs.
+    static const int env = [] {
         const char * s = getenv("GGML_V100_FA");
-        return !(s && s[0] == '0'); // default ON; GGML_V100_FA=0 = kill-switch
+        return s == nullptr ? -1 : (s[0] == '0' ? 0 : 1);
     }();
-    return v;
+    if (env >= 0) {
+        return env == 1;
+    }
+    // Default: Volta keeps the fork kernel. On Turing (the 2070) it measured
+    // 8-15% slower than the upstream mma kernel at every prefill length and
+    // the gap grows with context, so the upstream kernel wins there.
+    return cc == GGML_CUDA_CC_VOLTA;
 }
 
 bool ggml_cuda_flash_attn_ext_v100_available(const ggml_tensor * dst) {
@@ -1181,7 +1189,7 @@ bool ggml_cuda_flash_attn_ext_v100_available(const ggml_tensor * dst) {
     const ggml_tensor * mask = dst->src[3];
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
-    if (!ggml_cuda_flash_attn_ext_v100_enabled()) {
+    if (!ggml_cuda_flash_attn_ext_v100_enabled(cc)) {
         return false;
     }
     if (cc != GGML_CUDA_CC_VOLTA && cc != GGML_CUDA_CC_TURING) {
