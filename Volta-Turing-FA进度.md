@@ -827,3 +827,33 @@ shell 的 PATH 里，要用绝对路径；grep `flash_attn_ext_v100_kernel` 看�
 再要收益必须换架构（旧路径的 split-KV + combine，或 O 落 smem/分 D 的完全重排，后者已因 smem/重复 QK
 被否决）。**建议：引擎冻结为 opt-in 研究产物（`GGML_V100_FA_MMA=1`），主线继续用 wmma pair（2731）**，
 把剩余预算投到 V100 侧验证与文档，而不是继续在这个布局上做微优化。
+
+### 部署决策数据：2070 上「本 fork FA」vs「上游 FA」（2026-09-24）
+
+同机（RTX 2070 / sm_75）、同模型（translategemma-4b-it.i1-Q4_K_M，f16 KV）、同一批 job 内 back-to-back、r3：
+
+| prefill | 本 fork 默认 FA（路线 A pair）| 上游 FA（`GGML_V100_FA=0`）| 差距 |
+|---|---|---|---|
+| pp1024 | 3029.0 | 3042.9 | -0.5%（噪声）|
+| pp4096 | 2765.1 ± 1.4 | 3014.6 ± 3.7 | **-8.3%** |
+| pp8192 | 2609.4 ± 0.5 | 2948.5 ± 1.4 | **-11.5%** |
+| pp16384 | 2386.6 ± 0.2 | 2807.4 ± 15.1 | **-15.0%** |
+| tg32 | 107.56 | 105.92 | +1.5% |
+
+日志：`sm75-优化存档/upstream-vs-fork.log`，脚本 `sm75-优化存档/upstream-vs-fork.sh`（可复跑）。
+
+**新事实（重要）**：本 fork 的 FA 在这块卡上**随 context 变长差距单调扩大到 -15%**，与 V100 上的方向相反
+（V100 上本 fork FA 在 pp512/pp2048 是赢的）。所以「本 fork FA 只适合 V100 / 长 context」这类直觉在 2070
+上不成立 —— 在 2070 上它**任何 prefill 长度都不划算**，只有 decode 略好（+1.5%）。
+
+**部署建议（据上表）**
+
+| 需求 | 选择 |
+|---|---|
+| TurboQuant 特性 + 最高速度 | **`TheTom/llama-cpp-turboquant`**（本 fork 的上游；它含全部 Turbo 特性且用上游 FA）。本地检出 `~/SharedData/llama-cpp-turboquant` 落后其 origin **70 个提交，部署前先更新** |
+| 想跑本 fork 的代码 | 本 fork + **`GGML_V100_FA=0`**（等价上游 FA，另带我们的 graph null-deref 修复）|
+| 需要 turbo2/3/4 KV | 只能本 fork 默认（fork FA 是旋转域的必需件），付 8~15% prefill |
+| 完全不用 TurboQuant | ggml-org llama.cpp |
+
+**待修（建议）**：sm_75 上 fork FA 是**默认启用**的（闸门按 cc 700/750 放行），但它在 2070 上任何 prefill
+长度都更慢 —— 这是默认值陷阱。应收窄为「仅当请求 turbo KV 类型时才走 fork FA，否则回退上游 FA」。

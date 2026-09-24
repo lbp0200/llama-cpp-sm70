@@ -1,0 +1,26 @@
+Warning: Permanently added '10.1.2.16' (ED25519) to the list of known hosts.
+Warning: Permanently added '10.1.2.16' (ED25519) to the list of known hosts.
+Warning: Permanently added '10.1.2.16' (ED25519) to the list of known hosts.
+--- fork FA (default, route A pair) ---
+  Device 0: NVIDIA GeForce RTX 2070, compute capability 7.5, VMM: yes, VRAM: 7784 MiB
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp1024 |     3029.04 ± 121.89 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp4096 |       2765.08 ± 1.39 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp8192 |       2609.44 ± 0.48 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |         pp16384 |       2386.62 ± 0.24 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |            tg32 |        107.56 ± 0.54 |
+
+build: 1427929ac (10802)
+--- upstream FA (GGML_V100_FA=0) ---
+  Device 0: NVIDIA GeForce RTX 2070, compute capability 7.5, VMM: yes, VRAM: 7784 MiB
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp1024 |     3042.92 ± 120.21 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp4096 |       3014.56 ± 3.72 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |          pp8192 |       2948.49 ± 1.35 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |         pp16384 |      2807.39 ± 15.13 |
+| gemma3 4B Q4_K - Medium        |   2.31 GiB |     3.88 B | CUDA       |  99 |            tg32 |        105.92 ± 0.72 |
+
+build: 1427929ac (10802)
+UP_DONE
