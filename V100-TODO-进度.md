@@ -305,6 +305,33 @@ GGML_V100_FA=0    # 立即回到旧路径
      或等价的 KV 分段 grid 重构；Q_in_reg 次之。或在上游 issue #28037 语境下
      与维护者对齐优化路线。
 
+## 旧路径内层结构解剖（08:05，fattn-mma-f16.cuh 实读，下一步选型依据）
+
+QK 内核（本配置 Q_in_reg=true，nbatch_fa=64）：
+```cpp
+for (i_KQ = 0; i_KQ < nbatch_fa; i_KQ += np*T_A_KQ::I)   // KV 位置为外层
+  for (k_KQ = k0; k < k0_stop; k += T_A_KQ::J) {          // D 方向内层
+      load_ldmatrix(K_A, swizzled_smem);                  // K 分片经 swizzle+ldmatrix 装入
+      mma(KQ_C[i/...], Q_B[...], K_A);                    // Q 分片常驻寄存器（整个循环零 Q smem 流量）
+  }
+```
+与我们内层的结构差异（每 BN-tile 重复）：
+| | 旧路径 | 我们 (WMMA) |
+|---|---|---|
+| 矩阵指令 | mma.sync（Volta 交换 A/B）+ ldmatrix swizzle | nvcuda::wmma load_matrix_sync |
+| Q | **寄存器常驻**（Q_in_reg，每 tile 零 smem 读） | 每 (n,k) 从 sQ load_matrix |
+| KQ 分数 | KQ_C 按 wide/col-major 寄存器布局（np warps 分列） | **整块物化 smem（S）**，softmax 读写 smem |
+| 批处理 | KV 位置 64 一批（nbatch_fa），批间 rescale | 每 BN 整批 |
+| smem swizzle | fattn-swizzle 显式 XOR（K 方向） | 无（行主序 stride 256，可能有 bank conflict） |
+
+⟹ 两条可证伪的下一步候选（按成本排序）：
+A. **给 S/K/Q 的 smem 访问加 fattn-swizzle**（复用现有基础设施，~1-2h，若 bank conflict 显著
+   则立竿见影；无 ncu 无法预测，只能 A/B 实测）；
+B. **Q_in_reg 移植**：Q 分片常驻寄存器（省 Q smem 读 + 释放 16KB → 或换取更大 tile），
+   中等改动（QK 循环重组 + 寄存器预算）；
+C. **mma.sync+ldmatrix 重写 QK/PV**（结构级，多轮次，须防 Volta mma 操作数布局陷阱——
+   fragment 教训在案，动手前先单 warp probe）。
+
 ## 微杠杆增量（07:30-08:00，全部落在已验证内核上）
 
 | 杠杆 | pp65536 | 判定 |
