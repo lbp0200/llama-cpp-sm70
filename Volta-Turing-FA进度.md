@@ -435,7 +435,51 @@ attention 走 FlashInfer，源未本地化，留待后用）。README 实战提�
 - 教训：pair 首版未按 M 区分 -> decode 也走 pair，tg 掉 2.1%；A/B 数字以门控版为准
 - 日志：`sm75-优化存档/pair-bn48-experiment.log`、`pair-mgate128.log`
 
-**决策状态**：路线 A 完成并落库；路线 B（旧路径数据流移植）与 FlashInfer 研究为后续候选。
+**决策状态**：路线 A 完成并落库。用户选定 B（2026-09-24 下午）；B 勘察完成、实施按下述档案在后续 session 执行（多轮次工程，见档案说明）。FlashInfer 研究为辅助。
+
+### 路线 B 设计档案（勘察完成 2026-09-24 下午；原子已全部核对，未动内核代码）
+
+**为什么不是本 session 完成**：旧路径 2437 行、线程组织与我们根本不同（threadIdx.y 放
+Q 列、np 并行 warp、KQ_max 按列 shfl），移植=把旧内核体+我方外壳重组（网格/kv_ceiling/
+sinks/dst/pair band），300+ 行新代码 + 3-6 轮构建门禁，单 session 上下文会在半途留下
+坏树。勘察先行=下个 session 零重复阅读直接开工。
+
+**已核实的旧路径核心机制（全部 file:line 可回查）**：
+1. KQ 寄存器累加（fattn-mma-f16.cuh:925-975）：A=K 行=KV 从 tile_K[kv][D] plain
+   ldmatrix（stride=tile_stride(nbatch_K2)）；B=Q 从 tile_Q[k][ncol] k-major（stride
+   DKQ/2+4）；C=tile<16,8,float>；Q_in_reg=true 时 Q_B[k_KQ_0/J] 全 D 预载 -> Q 每块只读一次
+2. mask 直接入 KQ_C（:1003-1010）：get_i(l)->i(KV 行)、get_j(l)->j(Q 列)、
+   tile_mask[j*(nbatch_fa+8)+i]；v1 可改直接 __ldg gmem 省掉 tile_mask 预取
+3. softmax 全寄存器（:1015-1155）：KQ_max_new 按列 + shfl_xor 归约、exp 原地变 P、
+   KQ_rowsum 累加；全程无 __syncthreads、无 sS/sP
+4. rescale（:1158-1215）：KQ_max_scale（uint32 FTZ 技巧）乘 VKQ_C 与 KQ_rowsum
+5. P->PV（:1217-1230）：B[k] = get_transposed(get_half2(KQ_C[k]))（cols_per_warp==8）；
+   V 用 load_ldmatrix_trans 载为 A（:1265-1275）；VKQ_C 的 C=(DV x Q)，最终写回需转置
+6. 类型原子（mma.cuh:69-360）：Turing tile<16,8> get_i=((l/2)*8)+(x/4)、
+   get_j=((x%4)*2)+(l%2)；Volta C-layout 不同（32x8，get_i=(l&2)+(x&~2)）上游已双分支
+   -> 同一代码未来可服务 V100（等 7.3 回线启用）
+
+**勘察发现的硬约束**：
+- nbatch_fa/BLOCK_N 必须是 32 的倍数（config static_assert）-> **pair-BN48 在 B 下失效，
+  改 BN64**；smem 反而大幅释放（sS/sP/sRowMax/sRowSum/sO/expd 全部消灭）：
+  BN64 kv 33792 + tile_Q ~9216 + union/sV -> ~43KB <= 64KB 预算宽松
+- 线程组织冲突是移植主体：旧=列式 warp 组织；我们=行式 THREADS_PER_ROW + pair band +
+  kv_ceiling + sinks/dst 行契约。对策=新引擎只换 QK/softmax/PV 体，外壳（launcher、
+  grid、kv_max 侧核、sinks 插入点、dst [D][H][M] 写回、pair band<->ncols2 映射）全保留
+
+**实施路线（下个 session 直接按此开工）**：
+- 载体：cfg_sm75_pair 增 MMA 引擎（cfg flag 或独立内核函数），solo/wmma 路径不动
+- Q 侧：f32->f16 转置直写 tile_Q[k][row]（替代 sQ）；A=K plain、B=Q plain（均上游原式）
+- mask/sinks：mask 直接 __ldg，行索引=get_j 经 pair band 映射；sinks 在 KQ_max 段后按
+  Q 行插入（对偶我们现在的 per-row sink，VKQ_C 版=乘 exp_diff 寄存器版）
+- dst：VKQ_C(DV x Q) 逐 frag get_i/get_j 写回 [D][H][M]（head=band、token=Q 行映射）
+- 验收：470/470 x2 + 7747 + smoke；目标 pp4096 2732 -> >=2900（旧路径 3054）、tg 保持 108
+- 风险登记：get_transposed/get_half2 语义对照 :1217；KQ_max shfl 按列归属在 ncols=32
+  (2x16 band) 下复核；寄存器预算重估（KQ_C+VKQ_C 驻留 ~160 f32/thread，launch_bounds(2)
+  可能需降为 (1)）；mask 直读 gmem vs tile_mask 预取需实测取舍
+
+**备选（若只要数字）**：pair 形状派发级转调上游 mma 内核（20 行，pp4096 立得 ~3054），
+代价=pair wmma 引擎变成无人执行的死代码、门禁不再覆盖它 -> 不推荐，除非用户明示。
 
 ## 2070 回线验证（task-6 已实测，2026-09-24 上午补做）
 
