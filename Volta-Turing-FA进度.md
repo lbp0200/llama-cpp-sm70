@@ -496,6 +496,48 @@ sinks/dst/pair band），300+ 行新代码 + 3-6 轮构建门禁，单 session �
   （需 ggml_cuda_error/ggml_abort/ggml_cuda_get_device 三个桩）
 - 状态：**QK+PV 原子已实证，内核移植（pair-mma 引擎）可按设计档案直接开工**，最后的地雷已排
 
+### 路线 B 引擎实施设计（2026-09-24 定稿，下 session 照此机械执行）
+
+**关键陷阱（probe blockDim=32 掩盖的）**：`tile<>::get_i/get_j` 公式硬编码
+`threadIdx.x`，**只在单 warp（blockDim.x==32）下正确**；引擎 kernel 是 256 线程，
+必须自写 lane 版包装（`x = threadIdx.x & 31`，公式照抄 mma.cuh tile<16,16,float>
+generic 分支：`get_i = ((l/2)%2)*8 + x/4`、`get_j = (l/4)*8 + (x%4)*2 + l%2`）。
+mma/ldmatrix PTX 本身按硬件 lane 工作，任意 blockDim 无碍 —— 只有展开公式要换。
+
+**块与 warp 组织（BLOCK_M=32 行=2 头 band，BN=64）**：
+- 每 n-tile（64 kv）：QK = 2 m-tile x 4 n16-sub = 8 个 mma tile，**8 warp 各领 1 个：
+  m_tile = w/4, sub = w%4**（满占用）；O 寄存器 frags（每 warp 16 个 d16 tile
+  = 128 f32）跨整个 n 循环常驻 —— **launch_bounds 必须 (256,1)**（(,2) 会把寄存器
+  压到 128/thread 不够）
+- QK：A = plain ldm 自 sQ + (m*16)*Q_STRIDE + k0h（h2 步进 8，16 步全 D）；
+  B = plain ldm 自 sK + (sub*16)*KV_STRIDE + k0h；`mma(S, A, B)`，
+  S 出来 (i=Q行[band 内 0..15], j=KV[sub*16..+15])
+- **mask 直接进 S 寄存器**：`S.x[l] = S.x[l]*scale + mask(start_row + tok_of(m*16+get_i),
+  start_col + get_j)`；**act 行无效（tok_of>=valid_tokens）必须跳过 mask 读置 NEG_INF**
+  （否则 M 非 16 倍数时 gmem 越界读）；mask 的 -inf 自然处理 kv 列越界，无需特判
+- **跨 warp 行归约**（行的 64 列分属 4 个 warp，shfl 过不去）：scratch_max[act_row][wi]
+  4 槽（wi = w%4）：写本地 max -> __syncthreads -> 各 warp 合成 new_max（含与持久
+  sRowMax 比较）-> exp_diff 就地缩放 O frags（`O.x[l] *= f[get_j]`，O 的 get_j = Q 行）
+  -> exp 本 warp 16 列切片 -> 写 scratch_sum[act_row][wi] -> sync -> wi==0 的 warp
+  汇总写 sRowMax/sRowSum -> sync。**每 n-tile 约 3-4 个 sync**，与现行 wmma 路径同量级
+- safe_max 钳制照抄现行（全 mask 行 exp(-inf)=0 -> 输出 0）
+- **PV**：`A = ldm_trans(sV + (kv0)*KV_STRIDE, KV_STRIDE)`（kv0 = sub16 无需 —— 注意
+  PV 的 k 走满 64 kv：k 步进 16 kv，4 步，A base = sV + (step*16)*KV_STRIDE）；
+  `B = get_half2(S)`（S 此刻已含 exp 后的 P）；`mma(O[d_tile], A, B)` 累加；
+  O 输出 (i=d, j=Q 行[band 内]) —— probe R2 精确 0 验证的正是此链
+- **K/V union 直接复用**：QK 用 sK、寄存器化 softmax 之后再载 V 覆盖 union —— 分数
+  不落 smem，union 永不冲突（这正是 wmma 路径做不到的）
+- sinks：n 循环后按 act 行（q_head_id + band）取 sink，max/sum 更新 + O frags 缩放
+  （get_j 行）+ 一次 regs rescale，逻辑对偶现行
+- dst 终写：`out = O.x[l] / sRowSum[act]`，act = m*16 + get_j(l)，
+  地址 `(start_row+tok_of(act))*stride_D2 + (q_head_id+band_of(act))*stride_D1`
+- 零可见路径、kv_ceiling、debug、launcher/派发全部沿用现行 pair 外壳
+- smem 预算：sQ 16896 + sKV union 33792 + sRowMax/Sum 256 + scratch 2x512 +
+  oreg 结构保留但不用（8.3KB 纯余量）≈ 60.2KB < 65536 ✓（删 oreg/expd 可再省，先不删减少 diff）
+- 实施形态：cfg 加 `MMA` 布尔（cfg_sm75_pair 置真），kernel 内 QK-softmax-PV 段与终写段
+  `if constexpr (CFG::MMA)` 双分支；solo/v100 编译路径字节不变
+- 验收：470/470 x2 + sweep + smoke；pp4096 2732 -> >=2900（旧 3054），tg 108 不动
+
 **备选（若只要数字）**：pair 形状派发级转调上游 mma 内核（20 行，pp4096 立得 ~3054），
 代价=pair wmma 引擎变成无人执行的死代码、门禁不再覆盖它 -> 不推荐，除非用户明示。
 
