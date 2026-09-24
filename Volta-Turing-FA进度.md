@@ -1,12 +1,46 @@
 # 1Cat Flash-V100 移植到 llama.cpp —— 进度与 TODO
 
-> 更新：2026-09-24（2070 正确性修复完成: Turing frag 映射 + v2 截断）
-> 分支：`feature/v100-fa-port`（5 commits，本地已提交）
->   491ecdd04 graph null-deref 修复
->   57f551ae7 v2 截断（旧实现，已被 02b7ffa8d 取代）
->   06837a189 Turing fragment 映射修复 + cfg 拆分 + gate 750
->   02b7ffa8d v2 截断（修复后重实现）
-> 机器：V100 = 192.168.7.3（sm_70, 32G）；2.16 = 10.1.2.16 RTX 2070（sm_75）
+> 更新：2026-09-24 晚（route B mma 引擎入库 + 性能阶梯；HEAD `0dfb65ea9`，已推送）
+> 分支：`feature/v100-fa-port`（origin = github.com/lbp0200/llama-cpp-sm70）
+> 本文件是战役总记录：**顶部 = 现状与待办；下方按时间序保留全部历史、证据与踩坑。**
+> 机器：V100 = 192.168.7.3（sm_70, 32G，**当前离线**）；2.16 = 10.1.2.16 RTX 2070（sm_75，在线，`bolt-remote`）
+
+## 现状摘要（2026-09-24 晚）
+
+**已交付、默认启用（主干零回归）**
+- Turing pair 路径（wmma + 寄存器 O，M>=128 且 GQA 偶数）：pp1024 2978 / **pp4096 2731** / tg32 108；
+  相对旧路径（3054）差距 -10.6%（历史：pad 战役 +10.9% 累计）
+- V100 路径：sm_70 全绿（470/470、sweep 7747），历史 r3 契约 pp512 795 / pp2048 788 / pp65536 333 / tg32 37；
+  V100 字节自 SM75 工作起未动（pad 按配置分级，硬规则）
+
+**route B mma 引擎（正确、opt-in：`GGML_V100_FA_MMA=1`）**
+- 正确性：470/470（默认路 + 显式路）、sweep 7747/7747、冒烟正常
+- 性能阶梯 pp4096：1771 -> 1762（swizzle，瓶颈证伪，保留）-> 1813（删冗余 sync + ef 惰性化）
+  -> 1841.5（Q_in_reg 窗口化）-> **2115.6（rescale 增长守卫，+14.9%）**；累计 **+20%**，距 wmma pair 仍 **-22.5%**
+
+## 待办（按优先级，下个 session 直接开工）
+
+1. **comb 扫描 shfl 化**（上一轮收 +14.9% 的同一类「集中式寄存器代价」）：`sn[16]` 目前每 lane
+   扫全 16 行（64 smem 读 + 48 fmax）；改为 lane i 算一行 + `shfl` 广播，每 lane 实际只需 6 行
+   （fi 的 2 + fj 的 4），grew 顺带 shfl 归约。预期再 +5~10%
+2. **跨 warp softmax -> 列内 warp 组织**（最大剩余结构差异）：我们每 tile 5 sync + scratch 两次
+   往返 + publish；旧路径 np-warp 列内 shfl、无 scratch 无 publish
+3. **Q 全 D 常驻**（16 frag = 64 regs，实测 spill）与 **launch_bounds(256,2) 对拍**
+4. 目标线：先 >=2731（超 wmma pair），再 >=2900（原验收线），tg 保持 108
+5. V100 回线后：**sm_70 验证 route B 引擎**（Volta C-layout 上游分支已备，但我们的 lane 版
+   ldm/get_i wrapper 需在 sm70 上验证）；按用户指示恢复生产服务
+
+## 铁律（每次改动必跑，本文件下半部有全部出处）
+
+- 门禁：`test-backend-ops -o FLASH_ATTN_EXT -p "hsk=256"` -> 470/470（默认路 + `GGML_V100_FA_MMA=1` 两路）
+  \+ sweep `-p "hsk=(64|128|192|256|512|576|640)"` -> 7747/7747 + 冒烟（`llama-cli`）有正常输出
+- **探针前置**：引擎类改动先跑 `probe5`（原子：QK/PV 操作数方向）与 `probe6`（跨 warp 行协议），
+  双 PASS 再动内核 —— 历史上这两个探针各抓到一类致命 bug（`ldmatrix`/`get_i` 的裸 `threadIdx.x`
+  单 warp 陷阱；xor 归约写成赋值而非组合）
+- 证据落盘：bench 全部 `tee` 进 `sm75-优化存档/` 并随 commit 入库（该目录已加 gitignore 例外）
+- 对照开关：`GGML_V100_FA_MMA=0`（pair wmma）/ `GGML_V100_FA=0`（上游 mma）随时 A/B
+- ncu 不可用（`ERR_NVGPUCTRPERM`，需 root 改驱动参数并重启）-> 性能问题只能靠 A/B 阶梯二分
+- 远端 git：origin 曾走 gh-proxy（间歇 403），已改直连；远端出现未跟踪同名文件挡 pull 时先 `rm`
 
 ---
 
