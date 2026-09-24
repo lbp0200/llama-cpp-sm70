@@ -946,3 +946,28 @@ graph 空指针 491ecdd04），不是提速项。
 split-D（1Cat 最核心的架构性差异）与 cp.async 流水从未移植」。而 #28037 那条参考本身就预告了今天的结局：
 上游在既有融合内核设计上的调优已近最优，剩余空间全在 split-D / fp32 smem / cp.async 这些**架构性**方向——
 这也解释了为什么我们从未跑赢上游。
+
+### 关键对照：1Cat 的思路 vs 上游实现（2026-09-24 核对源码）
+
+回答「是不是上游已经实现了 1Cat 的思路」——**不是，是同一个问题的另一套架构**。
+
+| 维度 | 1Cat `fused_mha_forward.cu` | 上游 `fattn-mma-f16.cuh` |
+|---|---|---|
+| 并行切分轴 | **split-D**（切 head dim）| **KV 轴分块**：`nbatch_fa`（源码注释原文「Number of KV rows per softmax rescaling of KQ rowsums and VKQ accumulators」）+ 独立 combine 内核 |
+| 分数存放 | 物化到 **fp32 smem** + 32 列子块 softmax | **寄存器累加**，softmax 全在寄存器（全文无 `__shared__ ... KQ`）|
+| 张量核 | WMMA（m16n16k16）| `mma.sync` + `ldmatrix` + XOR swizzle |
+| 流水 | 手工 smem staging | `use_cp_async` 模板参数 + `cp-async.cuh`；但 **`cp.async` 是 Ampere+（`CP_ASYNC_AVAILABLE`，sm_80 起）⇒ V100/2070 用不到** |
+| 调优粒度 | 单一块划分（16 warps / BM32 / BN64）| per-arch 配置表；**Volta 表只特判 D=512/576/640，D=256 落到 Turing/Ampere 表** |
+
+### 修正：档案中「旧路径 V100 领先 1.6x」的遗留假说
+
+原文写作「`nbatch_fa` 细粒度 CTA 分段 **+ cp.async 多级流水**」。**cp.async 这一半不可能**：该指令
+在 sm_70/75 上不存在（编译期 `CP_ASYNC_AVAILABLE` 不含这两代），所以 V100 上旧路径不可能用它。
+剩下待解释的只有 KV 轴分块/占用率侧（grid 远大于输出 tile 数 + seam fixup）。
+
+### 因此对「移植 1Cat」这件事的最终定性
+
+前提是「上游在架构性 headroom 上留了空位」。事实是上游**用另一条架构路线**（split-KV + 寄存器分数 +
+mma.sync + per-arch 配置表）把这个空间占了，且在我们两台机器上都更快。1Cat 的 kernel 在它自己的
+配套环境（vLLM、paged KV、D=256 模型）里可能确实很快，但**我们从未在它的原生环境里测过**——我们只造了
+一个「llama.cpp 形状」的衍生物，而这个衍生物在两个架构上都没跑赢上游。这就是本季移植的最终结论。
