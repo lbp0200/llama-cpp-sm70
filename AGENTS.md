@@ -41,13 +41,21 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
 
 ### SM75 dev/test target (RTX 2070, 10.1.2.16)
 
-- The 10.1.2.16 box (RTX 2070 / sm_75, 8 GB) is our fast-iteration test GPU. Its
-  production services were migrated away and disabled (never relied on it being
-  free; someone may bring them back):
+- The 10.1.2.16 box (RTX 2070 / sm_75, 8 GB) is the SM75 test GPU, but as of
+  2026-09-26 it is **back in production** and no longer a free box: `llama-server`
+  runs on :8080 (translategemma-4b + a COK LoRA) and :8081 (base model), plus the
+  `llama-gateway` front end, together holding ~6 GB of the 8 GB. Check before
+  touching it:
   ```bash
   ssh bolt-remote   # ssh alias (HostName 10.1.2.16)
-  sudo systemctl disable --now llama-server.service llama-gateway.service
+  systemctl list-units --state=running | grep -E 'llama|gateway'
+  nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
   ```
+  **Do not disable or kill those services** (an earlier revision of this file told
+  you to - that is stale). GPU correctness runs there are usually still fine - a
+  full `test-backend-ops` gate passed alongside them on 2026-09-26 without a
+  restart - but do not treat a number measured there as a benchmark, and do not
+  run anything that needs more than the ~2 GB left free.
 - **Final target model on the 2070: `translategemma-4b-it.i1-Q4_K_M.gguf`**
   (~2.5 GB, `~/models/` on the box, also mirrored under `~/Models/` on the dev
   Mac). It is the reference for all SM75 A/B: head_dim 256, GQA 2, f16 KV
@@ -67,8 +75,13 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
 - **Run repo scripts on the box with `./run-2070.sh <script-in-repo>`** - it syncs, then runs the
   script there with stdin closed (`llama-cli` otherwise eats the remaining script lines and the log
   silently ends early). `./run-2070.sh sm75-优化存档/gate-2070.sh` is the standard FATTN gate.
+- **Before any GPU work on either box, check what is already using it.** The 2070
+  is in production and the V100 may be borrowed; `nvidia-smi --query-compute-apps`
+  and `systemctl list-units --state=running` take two seconds and have already
+  caught one mistake (a full gate run launched at a production box).
 - The V100 box (192.168.7.3, sm_70, 32 GB) stays the large-model/long-context
   validation environment (Qwen3.8-27B IQ4_XS etc.). `ssh -i ~/.ssh/id_rsa lbp@192.168.7.3`.
+  It was clean (no services, 0 MiB used) as of 2026-09-26.
 - **On the V100, `-b 2048 -ub 2048 --spec-type draft-mtp` is the deployment config.**
   `-ub 2048` is worth +20~33% prefill and +8% decode; `--spec-type draft-mtp` adds
   +44% decode on real prose, for 552 MiB of VRAM and no second model file. Combined
