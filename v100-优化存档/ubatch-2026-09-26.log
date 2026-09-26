@@ -170,3 +170,29 @@ immediately for Turing and later (turing_mma_available), and for Pascal
 Volta is the only NVIDIA arch that falls through to the
 `ne11 < MMQ_DP4A_MAX_BATCH_SIZE (64)` threshold and therefore pays the
 per-ubatch weight dequantization. Do not carry this tuning to the 2070.
+
+================================================================
+Which flag is actually required, 2026-09-26
+================================================================
+llama-bench, pp2048, r=2, on the V100:
+
+| flags            | pp2048 tok/s |
+|------------------|-------------:|
+| (default)        |       795.44 |
+| -ub 2048         |       1049.28 |
+| -b 2048 -ub 2048 |       1049.59 |
+| -ub 4096         |       1048.81 |
+| -b 4096          |       795.62 |
+
+So -ub alone is sufficient and -b is not needed: the default n_batch is already
+2048, and llama-context.cpp:281 clamps n_ubatch = min(n_batch, n_ubatch), so
+-ub 2048 -> 2048 with the default -b.
+
+- -b alone does nothing (795.62 ~ default) because n_ubatch stays 512.
+- -ub 4096 is silently clamped to 2048 and lands on the same number.
+- One caveat for deployment: if a launch script sets a smaller -b (e.g. -b 1024),
+  then -ub 2048 gets clamped to 1024 and only part of the win is realized. Keep
+  -b >= 2048.
+
+Minimal deployment change: one flag, or one environment variable:
+  LLAMA_ARG_UBATCH=2048
