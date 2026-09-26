@@ -466,7 +466,15 @@ struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
+#ifdef LLAMA_VOLTA_ONLY_BUILD
+    // Volta-only build: see the LLAMA_VOLTA_ONLY_BUILD block in the root CMakeLists.txt
+    // and v100-优化存档/README.md. Volta is the only NVIDIA arch whose prefill
+    // re-dequantizes every weight once per ubatch, so a bigger physical batch removes
+    // most of that waste. Measured +20~37% prefill and +8% decode, output byte-identical.
+    int32_t n_ubatch              =  2048; // physical batch size for prompt processing (must be >=32 to use BLAS)
+#else
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
+#endif
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode

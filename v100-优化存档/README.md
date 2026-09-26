@@ -86,6 +86,36 @@ llama-server -m <model> -ngl 99 -c <ctx> -b 2048 -ub 2048 --spec-type draft-mtp
 （`llama-server`，temp 0，seed 1234，ub=512 与 ub=2048 的生成文本完全一致），
 所以这个改动是数值安全的。
 
+### ⚠️ 2026-09-26 起：Volta-only 构建的默认值已是 2048
+
+如果构建时 `-DCMAKE_CUDA_ARCHITECTURES=70`（**只含 70**），根 `CMakeLists.txt` 会定义
+`LLAMA_VOLTA_ONLY_BUILD`，于是：
+
+- `common/common.h` 的 `n_ubatch` 默认值变成 **2048**（不再是 512）
+- `llama-bench` 的默认值同步跟进（它有自己的默认值，不读 `common_params`）
+- **不需要传任何参数**
+
+实测（llama-server，15001 token）：
+
+| 配置 | pp tok/s |
+|---|---|
+| 不传任何 ub 参数（新默认生效）| **919.5** |
+| 显式 `-ub 512`（仍可覆盖回旧行为）| 711.4 |
+| 显式 `-ub 2048` | 910.8 |
+
+构建时门控（两机验证）：
+
+| 构建 | `-ub` 默认 | Volta-only 消息 |
+|---|---|---|
+| `CMAKE_CUDA_ARCHITECTURES=70`（V100）| **2048** | 有 |
+| `CMAKE_CUDA_ARCHITECTURES=75`（2070）| 512 | 无 |
+
+**2070 的生产构建一个字节都没变。** 为什么用构建时门控而不是运行期查架构：ggml 不暴露 cc
+（`ggml_backend_dev_*` 只给 name/description/memory，`ggml-cuda.h` 也没有），运行期门控要新增
+公开 API 或按设备名匹配，构建时门控零成本。
+
+> 下表中「默认」那一行的含义自此改变：在 sm_70 构建上它现在等于 2048。表里的数字是改动前测的。
+
 ### 最少只需要一个开关：`-ub 2048`
 
 `n_ubatch = min(n_batch, n_ubatch)`（`src/llama-context.cpp:281`），而 `-b` 默认就是 2048，

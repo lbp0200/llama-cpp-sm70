@@ -196,3 +196,39 @@ So -ub alone is sufficient and -b is not needed: the default n_batch is already
 
 Minimal deployment change: one flag, or one environment variable:
   LLAMA_ARG_UBATCH=2048
+
+================================================================
+Build-time default for Volta-only builds, 2026-09-26
+================================================================
+Implemented as option 1 (build-time), not a runtime arch check: ggml exposes no
+cc accessor (ggml_backend_dev_* gives only name/description/memory, and
+ggml-cuda.h has none), so gating on the device at runtime would need a new public
+API or device-name string matching. Gating on the build instead costs nothing.
+
+  CMakeLists.txt        if the CUDA arch list is exactly {70} (after stripping
+                        -real/-virtual/compute_), define LLAMA_VOLTA_ONLY_BUILD
+  common/common.h       n_ubatch defaults to 2048 under that macro, else 512
+  tools/llama-bench     same, so the benchmark does not misreport the default
+
+Verification, llama-server with a 15001 token prompt:
+
+| config                              | pp tok/s |
+|-------------------------------------|---------:|
+| no ub flags (new default applies)   |    919.5 |
+| explicit -ub 512 (still overrides)  |    711.4 |
+| explicit -ub 2048                   |    910.8 |
+
+llama-bench with no flags on the sm_70 build: pp2048 1059.36 (was 795.44).
+
+Build gating, checked on both boxes:
+
+| build                                | -ub default | Volta-only message |
+|--------------------------------------|------------:|--------------------|
+| CMAKE_CUDA_ARCHITECTURES=70 (V100)   |        2048 | printed            |
+| CMAKE_CUDA_ARCHITECTURES=75 (2070)   |         512 | absent             |
+
+So the 2070, which runs production, is byte-for-byte unaffected.
+
+Note for llama-bench: it keeps its own defaults (tools/llama-bench/llama-bench.cpp)
+and does not read common_params, which is why LLAMA_ARG_UBATCH had no effect there
+earlier. Its default now follows the same macro.

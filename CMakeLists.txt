@@ -199,6 +199,33 @@ if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
 endif()
 
 #
+# fork: a Volta-only CUDA build defaults n_ubatch to 2048
+#
+# Volta is the only NVIDIA arch whose prefill goes through "dequantize the weights to
+# f16, then cuBLAS": should_use_mmq() (ggml-cuda/mmq.cu) returns true immediately for
+# Turing and later (turing_mma_available), and for Pascal !fp16_mma_hardware_available
+# is true, so both already take the fused mmq path. Volta falls through to the
+# `ne11 < MMQ_DP4A_MAX_BATCH_SIZE` (64) threshold and therefore re-dequantizes every
+# weight once per ubatch, which costs 20-32% of prefill time and grows with context.
+#
+# Measured on the V100 (Qwen3.8-27B IQ4_XS, upstream FA kernel): pp2048 +33%,
+# pp16384 +23%, pp65536 +20%, tg128 +8%, generated text byte-identical, +378 MiB VRAM.
+# Evidence and the full analysis: v100-优化存档/README.md.
+#
+# Gated on the arch list so a Turing-or-later build is untouched. Pass -ub explicitly
+# to override.
+if (GGML_CUDA AND CMAKE_CUDA_ARCHITECTURES)
+    set(_llama_volta_archs "${CMAKE_CUDA_ARCHITECTURES}")
+    string(REGEX REPLACE "compute_|-real|-virtual" "" _llama_volta_archs "${_llama_volta_archs}")
+    string(REPLACE " " "" _llama_volta_archs "${_llama_volta_archs}")
+    list(LENGTH _llama_volta_archs _llama_volta_n)
+    if (_llama_volta_n EQUAL 1 AND _llama_volta_archs STREQUAL "70")
+        add_compile_definitions(LLAMA_VOLTA_ONLY_BUILD=1)
+        message(STATUS "Volta-only CUDA build: defaulting n_ubatch to 2048 (override with -ub)")
+    endif()
+endif()
+
+#
 # build the library
 #
 
