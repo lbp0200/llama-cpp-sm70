@@ -4,15 +4,14 @@
 #
 #   bash bench-ubatch-v100.sh [prefill|decode|nsys|all]
 #
-# All runs use GGML_V100_FA=0 (upstream FA kernel = the V100 deployment choice).
+# All runs use the default dispatch (upstream FA kernel).
 set -u
 
 REPO=${REPO:-$HOME/llama-cpp-sm70}
 MODEL=${MODEL:-$HOME/models/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf}
 BENCH=$REPO/build/bin/llama-bench
 
-export GGML_V100_FA=0
-unset  GGML_CUDA_FORCE_MMQ
+unset GGML_CUDA_FORCE_MMQ
 
 # llama-bench prints "| model | size | ... | test | t/s |"; field NF-1 is t/s.
 ts() { awk -F'|' '{print $(NF-1)}'; }

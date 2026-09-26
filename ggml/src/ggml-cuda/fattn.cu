@@ -2,7 +2,6 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-mma-turbo.cuh"
-#include "fattn-v100.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -988,14 +987,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 }
             }
         }
-    }
-
-    // Volta (SM70) FA path: 1Cat-style split-D WMMA kernel for fp16 K/V, D=256,
-    // causal prefill. Gate is strict (see ggml_cuda_flash_attn_ext_v100_available);
-    // GGML_V100_FA=0 routes back to the existing kernels for A/B comparison.
-    if (ggml_cuda_flash_attn_ext_v100_available(dst)) {
-        ggml_cuda_flash_attn_ext_v100(ctx, dst);
-        return;
     }
 
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {

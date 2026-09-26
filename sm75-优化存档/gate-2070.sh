@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# Standard correctness gate for the FA kernels on the 2070, run from the
-# synced tree. On sm_75 the default dispatch is the upstream mma kernel, so
-# the fork kernel and the route B engine are covered by explicit env runs.
+# Standard correctness gate for the FA paths on the 2070, run from the synced
+# tree. Both sm_70 and sm_75 now dispatch to upstream's fattn-mma-f16.cuh by
+# default (the fork FA kernel was deleted), so this covers the default path plus
+# the turbo KV path.
 set -u
 cd "$(dirname "$0")/.." || exit 1
-echo "--- default dispatch (upstream mma on sm_75) ---"
-./build/bin/test-backend-ops -o FLASH_ATTN_EXT -p "hsk=256" 2>&1 | grep -E "tests passed|backends passed"
-echo "--- fork FA (GGML_V100_FA=1) ---"
-GGML_V100_FA=1 ./build/bin/test-backend-ops -o FLASH_ATTN_EXT -p "hsk=256" 2>&1 | grep -E "tests passed|backends passed"
-echo "--- fork FA + route B engine ---"
-GGML_V100_FA=1 GGML_V100_FA_MMA=1 ./build/bin/test-backend-ops -o FLASH_ATTN_EXT -p "hsk=256" 2>&1 | grep -E "tests passed|backends passed"
-echo "--- sweep (fork FA) ---"
-GGML_V100_FA=1 ./build/bin/test-backend-ops -o FLASH_ATTN_EXT -p "hsk=(64|128|192|256|512|576|640)" 2>&1 | grep -E "tests passed|backends passed"
-echo "--- turbo KV smoke (default dispatch) ---"
-M=~/models/translategemma-4b-it.i1-Q4_K_M.gguf
-timeout 300 ./build/bin/llama-cli -m $M -p "Translate to English: Bonjour le monde." -n 40 --no-jinja -ngl 99 -no-cnv -ctk turbo3 -ctv turbo3 </dev/null 2>&1 | grep -A2 "Bonjour" | tail -2
+B=./build/bin/test-backend-ops
+
+echo "--- default dispatch (upstream mma) ---"
+$B -o FLASH_ATTN_EXT -p "hsk=256" 2>&1 | grep -E "tests passed|backends passed"
+echo "--- sweep ---"
+$B -o FLASH_ATTN_EXT -p "hsk=(64|128|192|256|512|576|640)" 2>&1 | grep -E "tests passed|backends passed"
+echo "--- turbo KV smoke: the decode path must run (Generation line) ---"
+# llama-cli's conversation banner eats the completion text, so assert on the
+# generation timing line instead: it only prints if the turbo KV decode ran.
+# Text-level turbo KV verification is in v100-优化存档/README.md (llama-server).
+timeout 600 ./build/bin/llama-cli -m $M -p "The capital of France is" -n 16 -ngl 99 -no-cnv \
+    -ctk turbo3 -ctv turbo3 </dev/null 2>&1 | grep -E "Generation:|error|failed" | tail -2

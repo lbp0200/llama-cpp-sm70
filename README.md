@@ -19,18 +19,13 @@
 ## About this fork
 
 This is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) that keeps
-the upstream tree fully synced and adds two things for older NVIDIA GPUs:
+the upstream tree fully synced and adds TurboQuant on top:
 
 - **TurboQuant KV cache** - `turbo2`, `turbo3`, `turbo4` cache types plus the
   `tq3_1s` / `tq4_1s` weight types. A fixed 128x128 Walsh-Hadamard rotation is
   applied before quantization, which compresses the KV cache far beyond
   `q8_0` with little quality loss. See
   [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md).
-- **Volta / Turing FlashAttention kernel** - a split-D WMMA port (1Cat dataflow)
-  for `D = 256` attention with fp32 score smem, sub-tile softmax and a
-  mask-derived KV scan bound for causal/SWA prefill. Enabled by default on
-  `cc == 700` (V100) and `cc == 750` (RTX 20xx); `GGML_V100_FA=0` falls back
-  to the upstream kernels.
 
 Target hardware and what it is used for:
 

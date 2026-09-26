@@ -51,8 +51,7 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
 - **Final target model on the 2070: `translategemma-4b-it.i1-Q4_K_M.gguf`**
   (~2.5 GB, `~/models/` on the box, also mirrored under `~/Models/` on the dev
   Mac). It is the reference for all SM75 A/B: head_dim 256, GQA 2, f16 KV
-  friendly, and it exercises the Volta FA kernel gate (`GGML_V100_FA`,
-  cc == 700 || cc == 750, both supported since 06837a189).
+  friendly.
 - Build on the box: `cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75`.
 - **Code sync: `./sync-2070.sh`** (rsync over the `bolt-remote` alias; copies the whole
   tree including uncommitted work, excludes `build/`, `.pi/` and the probe binaries, then
@@ -60,10 +59,11 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
   pusher, so **the 2070 needs no GitHub credentials and no private key** - do not register
   a key for it or run `git push` there. A stale `~/.ssh/id_rsa` copy may exist on the box;
   nothing in this workflow uses it.
-- **On sm_75 AND sm_70 the fork FA kernel is opt-in, not the default**: it measured slower than
-  upstream's `fattn-mma-f16.cuh` on both. V100 back-to-back with `-b 2048 -ub 2048`:
-  pp2048 -3.4%, pp16384 -20.9%, pp65536 about -38%. Cover the fork kernel and the engine with
-  `GGML_V100_FA=1` (plus `GGML_V100_FA_MMA=1`) when running the gate.
+- **Both sm_70 and sm_75 dispatch to upstream's `fattn-mma-f16.cuh`.** The fork Volta/Turing
+  FA kernel (`fattn-v100.cuh`) was deleted on 2026-09-26 after it measured slower on both
+  architectures back-to-back (V100 pp2048 -3.4% / pp16384 -20.9% / pp65536 -37.1%; 2070 -8%
+  at pp4096 to -15% at pp16384). Do not resurrect it without a same-card upstream baseline
+  first - that mistake cost a whole campaign.
 - **Run repo scripts on the box with `./run-2070.sh <script-in-repo>`** - it syncs, then runs the
   script there with stdin closed (`llama-cli` otherwise eats the remaining script lines and the log
   silently ends early). `./run-2070.sh sm75-优化存档/gate-2070.sh` is the standard FATTN gate.
@@ -88,8 +88,10 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
 - **The V100's absolute tok/s drifts up to ~10% between jobs** (clock falls from 1530 MHz to
   1260-1275 MHz under sustained load). Only within-job comparisons are trustworthy - every
   headline number in `v100-优化存档/` comes from a single job containing both sides.
-- Volta/SM75 FA work lives on branch `feature/v100-fa-port`
-  (`ggml-cuda/fattn-v100.cuh` + the graph null-deref fix).
+- The FA campaign (`feature/v100-fa-port`) is closed; its code was deleted on 2026-09-26, leaving
+  two genuine bug fixes behind (`fattn-vec.cuh`'s D512 VEC stub, `ggml-cuda.cu`'s graph null-deref
+  guard). The reasoning, evidence and negative results are in `Volta-Turing-FA进度.md` and
+  `v100-优化存档/`.
 - **SM75 gotcha (cost a full debug session): the 1Cat WMMA fragment ->
   (row, col) expansion only holds for Volta (HMMA.884). Turing (HMMA.16816)
   has a different fragment element order, so mask/scale applied through the
@@ -140,8 +142,6 @@ fork's turbo KV family in spirit (both bound KV bytes on Turing-class cards).
 | `GGML_CUDA_FUSE_CHAIN`      | unset    | `0` disables the elementwise chain fusion (SILU/GELU/ADD/MUL/SCALE/CLAMP runs into one kernel, `ggml_cuda_fuse_elem_chain`) |
 | `GGML_CUDA_Q8CACHE`         | unset    | `0` disables the per-graph shared-quantize cache in mmvq (gate and up projections reuse one q8_1 copy of the activation) |
 | `LLAMA_ATTN_ROT_K/V_OVERRIDE` | off   | Optional upstream attention rotation (TurboQuant manages its own rotation) |
-| `GGML_V100_FA`              | **off everywhere** | Fork Volta/Turing FA kernel (`fattn-v100.cuh`), f16 K/V only. Measured slower than upstream's `fattn-mma-f16.cuh` on both architectures back-to-back with `-b 2048 -ub 2048`: V100 pp2048 -3.4% / pp16384 -20.9% / pp65536 ~-38%; 2070 -8% at pp4096 to -15% at pp16384. Opt-in research build; `=1` enables |
-| `GGML_V100_FA_MMA`          | unset    | Route B mma engine inside the fork FA kernel (needs `GGML_V100_FA=1` as well). Correct but still slower: opt-in research build |
 | `GGML_CUDA_FORCE_MMQ`       | unset    | Route prefill GEMM through fused mmq instead of dequant+cuBLAS. On the V100 it is only worth it together with a large `-ub`: +0.5~1.3% at `-ub 2048`, but **-5.2% at `-ub 512`**. Do not enable globally |
 | `GGML_TQ_MMQ`               | unset    | Native TQ prefill mmq path (`ggml-cuda.cu:1968`). Same mechanism as `GGML_CUDA_FORCE_MMQ`, for TQ3_1S/TQ4_1S weights. Untested |
 
