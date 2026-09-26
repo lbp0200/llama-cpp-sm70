@@ -1,0 +1,100 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index e728bbd16..fa057d9af 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1524,6 +1524,95 @@ struct test_case {
+             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+             if (err > ud->tc->max_err(ud->backend1)) {
+                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
++                {
++                    // dump: first elements of both + worst element decoded via t1 dims
++                    size_t worst = 0;
++                    double wabs = -1.0;
++                    size_t nbad = 0;
++                    for (size_t i = 0; i < f1.size(); i++) {
++                        double d = std::fabs((double) f1[i] - (double) f2[i]);
++                        if (d > 1e-3) nbad++;
++                        if (d > wabs) { wabs = d; worst = i; }
++                    }
++                    const int64_t ne0 = t1->ne[0], ne1 = t1->ne[1], ne2 = t1->ne[2];
++                    printf("\n[DIFF] nbad=%zu/%zu (%.1f%%) worst_i=%zu (col=%lld head=%lld tok=%lld)\n",
++                        nbad, f1.size(), 100.0 * nbad / f1.size(), worst,
++                        (long long) (worst % ne0), (long long) ((worst / ne0) % ne1), (long long) (worst / (ne0 * ne1)));
++                    printf("[DIFF] %s(ref):", bn1);
++                    for (int i = 0; i < 8; i++) printf(" %.4f", f1[i]);
++                    printf("\n[DIFF] %s(got):", bn2);
++                    for (int i = 0; i < 8; i++) printf(" %.4f", f2[i]);
++                    printf("\n[DIFF] worst %s=%.5f %s=%.5f\n", bn1, f1[worst], bn2, f2[worst]);
++                    if (f1.size() >= (size_t) (ne0 * ne1) + ne0) {
++                        size_t b1 = (size_t) (ne0 * ne1);
++                        printf("[DIFF] tok1h0 ref:");
++                        for (int i = 0; i < 8; i++) printf(" %.4f", f1[b1 + i]);
++                        printf(" | got:");
++                        for (int i = 0; i < 8; i++) printf(" %.4f", f2[b1 + i]);
++                        size_t w1 = b1; double d1 = -1.0;
++                        for (size_t i = b1; i < b1 + (size_t) ne0; i++) {
++                            double d = std::fabs((double) f1[i] - (double) f2[i]);
++                            if (d > d1) { d1 = d; w1 = i; }
++                        }
++                        printf("\n[DIFF] tok1h0 worst col=%zu %s=%.4f %s=%.4f | badcols:",
++                            w1 - b1, bn1, f1[w1], bn2, f2[w1]);
++                        for (int qq = 0; qq < 4; qq++) {
++                            size_t cc = 0;
++                            for (int dc = 0; dc < 64; dc++) {
++                                if (std::fabs((double) f1[b1 + qq * 64 + dc] - (double) f2[b1 + qq * 64 + dc]) > 1e-3) cc++;
++                            }
++                            printf(" q%d:%zu", qq, cc);
++                        }
++                        printf("\n");
++                    }
++                    if (f1.size() >= (size_t) (ne0 * ne1) + ne0) {
++                        // row1 (tok1 head0) comparison + worst inside it
++                        size_t b1 = (size_t) (ne0 * ne1);
++                        printf("[DIFF] tok1h0 ref:");
++                        for (int i = 0; i < 8; i++) printf(" %.4f", f1[b1 + i]);
++                        printf(" | got:");
++                        for (int i = 0; i < 8; i++) printf(" %.4f", f2[b1 + i]);
++                        size_t w1 = b1; double d1 = -1.0;
++                        for (size_t i = b1; i < b1 + (size_t) ne0; i++) {
++                            double d = std::fabs((double) f1[i] - (double) f2[i]);
++                            if (d > d1) { d1 = d; w1 = i; }
++                        }
++                        printf("\n[DIFF] tok1h0 worst col=%zu %s=%.4f %s=%.4f | badcols:",
++                            w1 - b1, bn1, f1[w1], bn2, f2[w1]);
++                        for (int q = 0; q < 4; q++) {
++                            size_t c = 0;
++                            for (int dcol = 0; dcol < 64; dcol++) {
++                                if (std::fabs((double) f1[b1 + q * 64 + dcol] - (double) f2[b1 + q * 64 + dcol]) > 1e-3) c++;
++                            }
++                            printf(" q%d:%zu", q, c);
++                        }
++                        printf("\n");
++                    }
++                    // per-head bad counts (first 8 heads) + per-token-col pattern for row 0
++                    if (ne0 == 256 && f1.size() >= (size_t) (ne0 * ne1)) {
++                        printf("[DIFF] bad-per-head:");
++                        for (int64_t h = 0; h < ne1 && h < 8; h++) {
++                            size_t c = 0;
++                            for (size_t i = (size_t) (h * ne0); i < (size_t) ((h + 1) * ne0); i++) {
++                                if (std::fabs((double) f1[i] - (double) f2[i]) > 1e-3) c++;
++                            }
++                            printf(" %lld:%zu", (long long) h, c);
++                        }
++                        printf(" | bad-per-token(head0):");
++                        for (int64_t m = 0; m < ne2 && m < 8; m++) {
++                            size_t c = 0;
++                            size_t base = (size_t) (m * ne1 * ne0);
++                            for (int64_t h = 0; h < ne1; h++) {
++                                for (int64_t d = 0; d < ne0; d++) {
++                                    size_t i = base + (size_t) (h * ne0 + d);
++                                    if (i < f1.size() && std::fabs((double) f1[i] - (double) f2[i]) > 1e-3) c++;
++                                }
++                            }
++                            printf(" %lld:%zu", (long long) m, c);
++                        }
++                        printf("\n");
++                    }
++                }
+                 //for (int i = 0; i < (int) f1.size(); i++) {
+                 //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
+                 //}
