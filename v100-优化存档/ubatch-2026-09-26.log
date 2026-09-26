@@ -139,3 +139,34 @@ methodology notes
   string "llama-bench") and kills the remote shell -> exit 255. Use `pkill -x`.
 * Defaults: n_ubatch = 512 (common/common.h:469), n_batch = 2048 (llama-bench),
   n_ubatch = min(n_batch, n_ubatch) (src/llama-context.cpp:281).
+
+================================================================
+How to set -b / -ub (three equivalent ways), 2026-09-26
+================================================================
+llama-server, 15001 token prompt, one process per config, one request each:
+
+| way                                                        | pp tok/s |
+|------------------------------------------------------------|---------:|
+| default (the hard-coded 2048/512)                          |    712.1 |
+| command line: -b 2048 -ub 2048                             |    909.2 |
+| environment: LLAMA_ARG_BATCH=2048 LLAMA_ARG_UBATCH=2048    |    910.7 |
+
+Both explicit forms are equivalent. The definitions are in common/arg.cpp:1626-1639
+(`-b`/`--batch-size` -> LLAMA_ARG_BATCH, `-ub`/`--ubatch-size` -> LLAMA_ARG_UBATCH).
+
+WARNING: the environment variables do NOT work under llama-bench. Measured there:
+default 798.96, `LLAMA_ARG_BATCH=2048 LLAMA_ARG_UBATCH=2048` 791.78 (i.e. unchanged),
+`-b 2048 -ub 2048` 1053.66. llama-bench overwrites params.n_batch/n_ubatch with its
+own defaults after the env vars are applied. So: use the command line when
+measuring, either form when deploying.
+
+The defaults themselves are hard-coded and arch-independent (common/common.h:468-469,
+n_batch = 2048, n_ubatch = 512). There is no `if (cc == VOLTA) n_ubatch = 2048;`
+anywhere, so the win is real but invisible: only someone who knows about it gets it.
+
+Scope: this applies to sm_70 only. should_use_mmq (mmq.cu:330-356) returns true
+immediately for Turing and later (turing_mma_available), and for Pascal
+!fp16_mma_hardware_available is true, so both already take the fused mmq path.
+Volta is the only NVIDIA arch that falls through to the
+`ne11 < MMQ_DP4A_MAX_BATCH_SIZE (64)` threshold and therefore pays the
+per-ubatch weight dequantization. Do not carry this tuning to the 2070.

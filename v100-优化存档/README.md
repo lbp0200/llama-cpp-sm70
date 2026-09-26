@@ -86,6 +86,59 @@ llama-server -m <model> -ngl 99 -c <ctx> -b 2048 -ub 2048 --spec-type draft-mtp
 （`llama-server`，temp 0，seed 1234，ub=512 与 ub=2048 的生成文本完全一致），
 所以这个改动是数值安全的。
 
+### 三个开关都能传（已实测等效）
+
+`-b` / `-ub` 是普通的运行时参数（`common/arg.cpp:1626-1639`），不是写死的。
+llama-server，15001 token prompt：
+
+| 途径 | 形式 | pp tok/s |
+|---|---|---|
+| 默认（代码里的值）| — | 712.1 |
+| 命令行 | `-b 2048 -ub 2048` | **909.2** |
+| **环境变量** | `LLAMA_ARG_BATCH=2048 LLAMA_ARG_UBATCH=2048` | **910.7** |
+
+**部署时用环境变量就不必改命令行**（服务单元里加两行即可）。
+
+⚠️ **但环境变量在 `llama-bench` 上不生效**（实测 791.78，等于默认值）：llama-bench 会用自己的
+默认值覆盖 `params.n_batch/n_ubatch`。所以**测的时候用命令行，部署的时候两种都行** ——
+否则拿 llama-bench 去验环境变量会误以为没效果。
+
+### 真正的缺口：默认值写死且不看架构
+
+```cpp
+// common/common.h:468-469
+int32_t n_batch  = 2048;
+int32_t n_ubatch =  512;   // <- 就是它
+```
+
+全代码里没有任何按架构分支（没有 `if (cc == VOLTA) n_ubatch = 2048;`）。所以收益**存在但隐形** ——
+只有知道这件事的人才会去传，换个人或换套部署脚本就退回 712 tok/s。要根治得动代码：
+
+| 方向 | 做法 | 评价 |
+|---|---|---|
+| A. 按架构给默认值 | context 创建时已知设备 cc，Volta 就把 `n_ubatch` 提上去 | 见效快，但是打补丁 |
+| B. 根治 | 别重复解压权重（在 ubatch 之间复用解压结果），或把 `MMQ_DP4A_MAX_BATCH_SIZE` 阈值改成按架构判断 | 更对，可上游 |
+
+### 适用范围：这条只对 sm70 生效
+
+`should_use_mmq`（`mmq.cu:330-356`）对 NVIDIA 的判断链：
+
+```cpp
+if (turing_mma_available(cc)) return true;                    // sm_75+ 一律 mmq（融合）
+...
+if (GGML_CUDA_CC_IS_NVIDIA(cc))
+    return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;  // 64
+```
+
+| 架构 | fp16 张量核 | turing mma | prefill 路径 |
+|---|---|---|---|
+| Pascal (sm_60/61) | 无 | 无 | `!fp16_mma` = true -> **mmq（融合）** |
+| **Volta (sm_70)** | 有 | 无 | **`ne11 < 64`** -> cuBLAS + **每块重新解压** <- 唯一中招 |
+| Turing 起 (sm_75+) | 有 | 有 | **mmq（融合）** |
+
+**Volta 是唯一落进那个阈值分支的 NVIDIA 架构**，所以不要把这个调参照搬到 2070。
+（另：Pascal 也走 mmq，因为 `!fp16_mma_hardware_available` 为真。）
+
 decode 的 +8% 机制**未查清**（decode 只有 1 个 token，ub 理论上无关）。
 两次独立测量都是 +7~8%，可复现，但不要当成已解释的现象。
 
