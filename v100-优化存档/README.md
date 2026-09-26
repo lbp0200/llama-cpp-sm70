@@ -131,6 +131,41 @@ decode 在 32K 是 27 tok/s = 37 ms/token，而工作集是 14.6 GB 权重 + 2 G
 | `GGML_CUDA_FUSE_CHAIN=0` | -2% | 默认开着是对的 |
 | `GGML_V100_FA=1` (fork FA) | pp65536 -17~-18% | 见 `Volta-Turing-FA进度.md`，V100 默认应为 OFF |
 | turbo3 KV | 32K 持平；64K prefill -5.3% / decode -6.1% | 容量功能，不是速度功能。见 2b |
+| 外挂 draft 投机解码 | 散文（接受率 24.3%）**-55%**；数字列表（接受率 100%）+46% | 接受率决定正负号。外挂 2B draft 与目标分布不匹配，在真实文本上是实亏。见 2c |
+
+---
+
+## 2c. 投机解码：接受率决定一切，而真正的路是 MTP
+
+**先注意一个坑**：`-md <draft>` **不会**启用投机，它只设模型路径。
+`common_params_speculative::types` 默认是 `{NONE}`，只能由 `--spec-type <name>`
+或 draft 仓库里的 sidecar 填充。类型名是 `draft-simple`。
+不加 `--spec-type` 时服务器会打印 `[spec] loading draft model` 并占掉 3 GB 显存，
+但响应里没有 `draft_n` 字段、速度也完全不变 —— 看上去像「投机无效」，
+实际是「投机根本没跑」。
+
+| 场景 | 接受率 | tg tok/s | vs 基线 |
+|---|---|---|---|
+| 基线（散文） | — | 37.05 | — |
+| 投机 n_max=8（散文） | **24.3%** | 16.51 | **-55.4%** |
+| 投机 n_max=16（散文） | — | 13.59 | -63.3% |
+| 投机 n_max=8（数字列表） | **100%** | 54.06 | +45.9% |
+
+n_max=8 时每步成本是 8 次 draft 前向 + 1 次批量验证。2B Q8 每 token 读 ~2.7 GB，
+27B 读 ~14.6 GB，即 draft 约便宜 5 倍，所以盈亏平衡点大约在 **60~70% 接受率**。
+实测散文只有 24.3% -> 大亏。
+
+列表那个 100% **不是真实工作负载信号**（draft 能精确预测确定性数列）。
+不要用列表/计数类 prompt 去评估投机。
+
+### 真正的线索：这个模型自带 MTP 头
+
+GGUF 元数据：`qwen35.nextn_predict_layers = 1`。
+
+MTP 头是针对目标模型自己的分布训的，真实文本上的接受率应该远高于外挂 2B draft 的 24.3%。
+llama.cpp 有对应的投机类型（`COMMON_SPECULATIVE_TYPE_DRAFT_MTP`，`common/common.h:174`）。
+**这是尚未测过的 decode 杠杆，而且用的是模型自己的头，不是外挂模型。**
+原始日志见 `speculative-2026-09-26.log`。
 
 ---
 

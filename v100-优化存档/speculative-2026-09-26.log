@@ -1,0 +1,89 @@
+V100 (192.168.7.3) speculative decoding, 2026-09-26
+repo: ~/llama-cpp-sm70 @ 793dc79a2
+target: Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf
+draft:  Qwen3.5-2B-UD-Q8_K_XL.gguf
+env: GGML_V100_FA=0, -ngl 99 -c 8192 -b 2048 -ub 2048, llama-server /completion
+request: temperature 0, seed 7, cache_prompt false
+
+================================================================
+Getting speculation to actually run
+================================================================
+`-md <draft>` alone does NOT enable speculation in this version. It only sets the
+draft model path. `common_params_speculative::types` defaults to
+{COMMON_SPECULATIVE_TYPE_NONE} and is only populated by:
+  * --spec-type <name>   (common/arg.cpp:4237)
+  * a discovered sidecar in the draft repo (common/arg.cpp:559-577)
+
+The draft-model type name is "draft-simple" (common/speculative.cpp:35).
+
+Without --spec-type the server logs "[spec] loading draft model ..." and reserves
+the VRAM, but the timings response has no draft_n / draft_n_accepted keys and
+throughput is unchanged. That looks like "speculation did not help" but it is
+actually "speculation never ran".
+
+Correct invocation:
+  llama-server -m <target> -md <draft> -ngld 99 --spec-type draft-simple \
+               --spec-draft-n-max 8 ...
+
+================================================================
+Results
+================================================================
+prompt A (prose): "Write a 400 word technical explanation of how flash attention
+                   reduces memory traffic."   n_predict 400
+prompt B (list):  "Write out the integers from 1 to 300, one per line, with no
+                   commentary."               n_predict 200
+
+| case                 | tg tok/s | draft_n | accepted | rate   | vs baseline |
+|----------------------|---------:|--------:|---------:|-------:|------------:|
+| baseline, prose      |    37.05 |       - |        - |      - |           - |
+| spec n_max=8, prose  |    16.51 |     812 |      197 | 24.3%  |      -55.4% |
+| spec n_max=16, prose |    13.59 |       - |        - |      - |      -63.3% |
+| spec n_max=8, list   |    54.06 |     176 |      176 | 100.0% |      +45.9% |
+| baseline, list       |    37.15 |       - |        - |      - |           - |
+
+================================================================
+Reading
+================================================================
+Acceptance rate decides the sign, and it is not close.
+
+With n_max=8 the cost per step is 8 draft forwards + 1 batched verify, so the
+break-even acceptance is roughly 1 - (draft_cost x 8) / (target_cost). The 2B Q8
+draft reads ~2.7 GB/token vs the 27B's ~14.6 GB, i.e. roughly 5x cheaper, so
+break-even sits around 60-70% acceptance. Measured 24.3% on prose -> a large loss.
+
+100% acceptance on the counting task is not a real workload signal: the draft
+predicts a deterministic sequence exactly. Do not use a list/counting prompt to
+promote speculation.
+
+================================================================
+The real lead: this model ships an MTP head
+================================================================
+GGUF metadata: qwen35.nextn_predict_layers = 1
+
+So the model has a built-in next-token-prediction head. An MTP head is trained
+against the target's own distribution, so its acceptance on real prose should be
+far above the 24.3% a foreign 2B draft achieves. llama.cpp has an MTP speculative
+type (COMMON_SPECULATIVE_TYPE_DRAFT_MTP, common/common.h:174); 1Cat's own notes
+report MTP/4 or DFlash2 lifting SM75-class decode from ~33 to 95-220 tok/s.
+
+This is the untested decode lever, and it uses the model's own head rather than a
+mismatched external model.
+
+================================================================
+Also confirmed: model shape (from GGUF metadata)
+================================================================
+  qwen35.block_count               = 65
+  qwen35.full_attention_interval   = 4     -> 16 full-attention layers + 49 GDN
+  qwen35.attention.head_count      = 24
+  qwen35.attention.head_count_kv   = 4     -> GQA 6
+  qwen35.attention.key_length      = 256
+  qwen35.attention.value_length    = 256
+  qwen35.embedding_length          = 5120
+  qwen35.context_length            = 262144
+
+Attention throughput cross-check at pp65536 (causal 4ND count, 16 full-attn
+layers, Hq=24, D=256):
+  llama.cpp upstream FA, from the nsys run: 0.844 PFLOP causal / 51.4 s = ~16 TF/s
+  1Cat production kernel, M=768/N=65536/Hq=6, from its ledger: ~19 TF/s
+Cross-stack, different shapes - weak evidence, but it puts the attention headroom
+in the 15-25% range, i.e. ~7-10% end to end at 44% attention share. Unverified.
