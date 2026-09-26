@@ -1,0 +1,88 @@
+V100 (192.168.7.3) MTP speculative decoding, 2026-09-26
+repo: ~/llama-cpp-sm70 @ 793dc79a2
+model: Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf
+env: GGML_V100_FA=0, llama-server -ngl 99 -c 8192 -b 2048 -ub 2048
+request: temperature 0, seed 7, cache_prompt false, prose prompt, n_predict 400
+
+================================================================
+The model ships its own MTP head
+================================================================
+GGUF metadata: qwen35.nextn_predict_layers = 1
+
+llama.cpp exposes this as --spec-type draft-mtp. No second model file is needed:
+the server log says "creating MTP draft context against the target model", and it
+costs 552 MiB of extra VRAM instead of a whole second model.
+
+  --- base
+    tg=37.03 tok/s
+  --- mtp  (--spec-type draft-mtp)
+    tg=53.44 tok/s   acceptance 54.8% (247 accepted / 451 drafted), mean len 2.64
+    (+44.3%)
+
+Compare with an external draft model (Qwen3.5-2B Q8, --spec-type draft-simple):
+acceptance 24.3% on the same prompt and 16.51 tok/s, i.e. -55.4%. An MTP head
+trained against the target's own distribution is the difference between +44% and
+-55%.
+
+n-gram self-speculation (--spec-type ngram-mod / ngram-cache) did not engage at
+all: no draft_n in the response, throughput identical to baseline.
+
+================================================================
+Draft depth: the default is already optimal
+================================================================
+--spec-draft-n-max sweep, same prose prompt, temp 0:
+
+| n_max        | tg tok/s | acceptance | text vs baseline |
+|--------------|---------:|-----------:|------------------|
+| default (3)  |    53.44 |      54.8% | (not hashed)     |
+| 4            |    51.31 |      44.8% | IDENTICAL        |
+| 8            |    30.47 |      23.8% | **DIFFERS**      |
+| 16           |    23.15 |      12.8% | IDENTICAL        |
+| adaptive(8)  |    52.29 |      54.8% | IDENTICAL        |
+
+Acceptance decays fast with depth, so drafting deeper than ~3 is pure loss. Do not
+raise --spec-draft-n-max.
+
+================================================================
+Caveat: one depth changed the output
+================================================================
+Speculative decoding must be lossless at temperature 0, and n_max 4 / 16 /
+adaptive all produced byte-identical text. n_max=8 did not (sha f490399dc8e5 vs
+2e8a2141da13).
+
+Most likely cause: the verify step batches n_max+1 tokens, which changes the GEMM
+shape and therefore the accumulation order, so logits shift slightly and an argmax
+near a tie can flip. That matches the pattern - shallower and deeper depths
+matched, one in the middle did not.
+
+This is a numerics caveat, not a proof of a bug, but it means "speculation is
+lossless" should not be assumed without a per-config text check. At the
+recommended default depth the text is identical.
+
+================================================================
+Final verification (single job, so comparable)
+================================================================
+  === decode, prose 400, temp 0 ===
+    old (-b 512  -ub 512)                            tg=37.01  sha=2e8a2141da13
+    rec (-b 2048 -ub 2048 --spec-type draft-mtp)     tg=53.44  sha=2e8a2141da13
+    text: IDENTICAL                                    (+44.4%)
+
+  === long-context decode, p32768 n128 r2 (no MTP; llama-bench has no draft) ===
+    pp32768  773.41 +- 2.87
+    tg128     32.75 +- 0.01
+
+  === prefill with -b 2048 -ub 2048, r=2 ===
+    pp2048   1034.34 +- 12.02
+    pp16384   860.28 +- 21.14
+
+================================================================
+Reproducibility warning (new)
+================================================================
+Absolute numbers drift between jobs on this box, by up to ~10% at long context.
+The same config (p32768 n128 r2, f16 KV, ub=2048) measured pp32768 = 707.77 +- 9.94
+in one job and 773.41 +- 2.87 in another, and tg128 = 27.16 vs 32.75. 1Cat's own
+ledger notes the V100 clock falls from 1530 MHz to 1260-1275 MHz under sustained
+load, which is the likely cause.
+
+So: only within-job comparisons are trustworthy. Every headline number in this
+archive is quoted from a single job that contains both sides of the comparison.

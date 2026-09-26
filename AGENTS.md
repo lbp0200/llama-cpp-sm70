@@ -68,12 +68,25 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
   silently ends early). `./run-2070.sh sm75-优化存档/gate-2070.sh` is the standard FATTN gate.
 - The V100 box (192.168.7.3, sm_70, 32 GB) stays the large-model/long-context
   validation environment (Qwen3.8-27B IQ4_XS etc.). `ssh -i ~/.ssh/id_rsa lbp@192.168.7.3`.
-- **On the V100, `-b 2048 -ub 2048` is worth +20~33% prefill and +8% decode.**
-  `n_ubatch` defaults to 512, and on Volta prefill always goes through
+- **On the V100, `-b 2048 -ub 2048 --spec-type draft-mtp` is the deployment config.**
+  `-ub 2048` is worth +20~33% prefill and +8% decode; `--spec-type draft-mtp` adds
+  +44% decode on real prose, for 552 MiB of VRAM and no second model file. Combined
+  decode is 37.0 -> 53.4 tok/s and the generated text is byte-identical. Root cause of
+  the prefill win: `n_ubatch` defaults to 512, and on Volta prefill always goes through
   "dequantize the weights to f16, then cuBLAS" (`MMQ_DP4A_MAX_BATCH_SIZE` gate in
-  `ggml-cuda/mmq.cu`), so the dequant cost is `ceil(prompt/ub) x weight bytes` and
-  grows with context. Confirmed on `llama-server` at 15k tokens: 694.7 -> 840.7 tok/s
-  (+21.0%). Evidence, raw logs and a rerun script: `v100-优化存档/`.
+  `ggml-cuda/mmq.cu`), so the dequant cost is `ceil(prompt/ub) x weight bytes` and grows
+  with context. Confirmed on `llama-server` at 15k tokens: 694.7 -> 840.7 tok/s (+21.0%).
+  Evidence, raw logs and a rerun script: `v100-优化存档/`.
+- **MTP speculation needs `--spec-type draft-mtp`; `-md` alone does nothing.** In this
+  version `-md <draft>` only sets the draft path, while `common_params_speculative::types`
+  stays `{NONE}`. Without `--spec-type` the server logs `[spec] loading draft model`, reserves
+  the VRAM, and then runs plain decoding - it looks like "speculation did not help" when it
+  never ran. Also `--draft-max`/`--draft-min` do not exist here; the flags are
+  `--spec-draft-n-max` / `--spec-draft-n-min`. Do not raise the depth above the default 3:
+  MTP acceptance decays fast with depth (54.8% at 3, 23.8% at 8) and deeper drafting loses.
+- **The V100's absolute tok/s drifts up to ~10% between jobs** (clock falls from 1530 MHz to
+  1260-1275 MHz under sustained load). Only within-job comparisons are trustworthy - every
+  headline number in `v100-优化存档/` comes from a single job containing both sides.
 - Volta/SM75 FA work lives on branch `feature/v100-fa-port`
   (`ggml-cuda/fattn-v100.cuh` + the graph null-deref fix).
 - **SM75 gotcha (cost a full debug session): the 1Cat WMMA fragment ->
