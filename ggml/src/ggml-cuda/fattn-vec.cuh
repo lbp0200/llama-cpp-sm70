@@ -68,26 +68,6 @@ static __global__ void flash_attn_ext_vec(
         return;
     }
 
-    // D512 VEC instances need >48KB smem (ne_combine = nwarps*V_cols_per_iter*512);
-    // ptxas rejects them on sm_70/75 (48KB static limit) even though the host
-    // dispatch never selects D512 VEC there (Q->ne[0] <= 256 gate on CUDA).
-    // Stub the body so the instance .cu files still compile on those archs.
-#if defined(GGML_USE_CUDA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
-    if (D == 512) {
-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
-            max_bias, m0, m1, n_head_log2, logit_softcap,
-            ne00, ne01, ne02, ne03,
-                  nb01, nb02, nb03,
-            ne10, ne11, ne12, ne13,
-                  nb11, nb12, nb13,
-                  nb21, nb22, nb23,
-                  ne31, ne32, ne33,
-                  nb31, nb32, nb33);
-        NO_DEVICE_CODE;
-        return;
-    }
-#endif // sm_70/75 D512 stub
-
     //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
@@ -181,19 +161,10 @@ static __global__ void flash_attn_ext_vec(
     constexpr int ne_combine = nwarps*V_cols_per_iter*D;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     half2            VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
-    // sm_70/75: D512 body is stubbed above; keep a 1KB placeholder so ptxas passes.
-    __shared__ half   KQ[D == 512 ? 8 : (ne_KQ > ne_combine ? ne_KQ : ne_combine)];
-#else
     __shared__ half   KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
-#endif
 #else
     float2           VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
-    __shared__ float  KQ[D == 512 ? 8 : (ne_KQ > ne_combine ? ne_KQ : ne_combine)];
-#else
     __shared__ float  KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
-#endif
 #endif // V_DOT2_F32_F16_AVAILABLE
 
     // Shared-memory LUT for turbo KQ scoring: precompute Q[d] * centroid[c] once,
