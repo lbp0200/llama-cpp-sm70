@@ -79,6 +79,16 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
   is in production and the V100 may be borrowed; `nvidia-smi --query-compute-apps`
   and `systemctl list-units --state=running` take two seconds and have already
   caught one mistake (a full gate run launched at a production box).
+- **The 2070's serving config is measured, not guessed.** `--cache-type-k/v q8_0`
+  costs ~18% decode (f16 KV is ~4 MB at `-c 1024`, so the compression buys nothing),
+  and the runtime `--lora` costs ~28% prefill / ~23% decode because `build_lora_mm`
+  adds 476 tiny matmuls per step (`llama-graph.cpp:1534`). **Merging the LoRA is a
+  wash - do not retry it**: Q4 loses the delta to quantization error, Q6_K keeps it
+  but its 28% extra bytes cancel the saved kernels. Full evidence, including three
+  claims this investigation retracted: `sm75-优化存档/2070-tg-lora-调查-2026-09-26.md`.
+  Note the deployed binary is NOT this tree's build (`/usr/local/bin/llama-server`,
+  version 10830 / `a3d5603d1`, a commit not present here), so per-request numbers
+  from it are not comparable to `build/bin/llama-server`.
 - The V100 box (192.168.7.3, sm_70, 32 GB) stays the large-model/long-context
   validation environment (Qwen3.8-27B IQ4_XS etc.). `ssh -i ~/.ssh/id_rsa lbp@192.168.7.3`.
   It was clean (no services, 0 MiB used) as of 2026-09-26.
