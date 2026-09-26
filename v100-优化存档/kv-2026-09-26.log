@@ -1,0 +1,54 @@
+V100 (192.168.7.3) TurboQuant KV + correctness, 2026-09-26
+repo: ~/llama-cpp-sm70 @ 793dc79a2
+model: Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf (14.62 GiB)
+env: GGML_V100_FA=0, GGML_CUDA_FORCE_MMQ unset, all runs -b 2048 -ub 2048
+
+================================================================
+1. correctness: does the -ub 2048 change alter the output?
+================================================================
+llama-server, temp 0, seed 1234, prompt "The capital of France is", n_predict 32:
+
+--- ub=512
+  text: ' Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy is Rome.\nThe capital of Spain is Madrid.\nThe capital of Portugal is'
+  prompt_n=5 pp=25.8 tg=37.37
+--- ub=2048
+  text: ' Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy is Rome.\nThe capital of Spain is Madrid.\nThe capital of Portugal is'
+  prompt_n=5 pp=25.6 tg=37.37
+
+  Identical text, identical decode rate. The ubatch change is numerically safe
+  for this workload. (It changes the GEMM M dimension, so this is evidence, not
+  a proof; re-check on any model whose quantized path is accumulation-order
+  sensitive.)
+
+================================================================
+2. TurboQuant KV on V100: capacity, not speed
+================================================================
+llama-bench -p <ctx> -n 128, ub=2048. "-ctk X -ctv X" is what was requested;
+the K column shows what the fork's TURBO_AUTO_ASYMMETRIC=1 auto-selection
+actually used (q8_0 K + turbo3 V for this GQA=6 model).
+
+--- 32K context, r=2 ---
+kv=f16/f16      pp32768  707.77 +- 9.94    tg128  27.16 +- 2.24
+kv=q8_0/q8_0    pp32768  699.92 +- 3.04    tg128  27.02 +- 2.12
+kv=q8_0/turbo3  pp32768  707.08 +- 7.51    tg128  26.31 +- 1.93
+kv=q8_0/turbo4  pp32768  701.80 +- 6.29    tg128  26.79 +- 2.07
+
+--- 64K context, r=1 ---
+kv=f16/f16      pp65536  596.09            tg128  28.16
+kv=q8_0/turbo3  pp65536  564.50            tg128  26.45
+
+  Verdict: no speed benefit at 32K (all within 1 sigma), and a 5.3% prefill /
+  6.1% decode LOSS at 64K. TurboQuant KV is a memory-capacity feature on this
+  hardware, not a speed feature.
+
+  Why: decode at 32K is 27 tok/s = 37 ms/token while the working set is
+  14.6 GB weights + 2 GB KV = 16.6 GB, i.e. 451 GB/s effective against a
+  ~900 GB/s peak. Decode is latency/occupancy bound, not byte bound, so
+  removing KV bytes buys nothing, while the turbo path adds dequant work
+  inside the attention kernel.
+
+  KV size per token for this model (16 full-attn layers of 64, 4 KV heads,
+  D=256): 4 x 256 x 2 x 2 B x 16 = 64 KiB at f16, ~13 KiB at turbo3.
+  So KV is 12% of the decode working set at 32K and 23% at 64K.
+
+  This is the fork's headline feature, and it does not pay off on V100.
