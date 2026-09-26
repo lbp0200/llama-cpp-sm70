@@ -178,9 +178,22 @@ A green run means the cases that ran passed, not that your change was exercised.
 
 ### Git workflow
 
-- Remotes: `origin` = TheTom/llama-cpp-turboquant (this repo); the fork remote tracks the upstream TurboQuant fork (same repo, two names); add `upstream` = ggml-org/llama.cpp when syncing
-- Main branches: `feature/turboquant-kv-cache` tracks the upstream TurboQuant fork
-- Upstream master is always fully contained in the tree (verified by rebase parity audits; git log is the record of the last sync point)
+- Remotes: `origin` = `lbp0200/llama-cpp-sm70` (this repo, the only remote configured). There is no
+  `upstream` remote; `ggml-org/llama.cpp` master reaches us inside `origin/feature/turboquant-kv-cache`,
+  which tracks the TurboQuant fork (itself a fork of ggml-org master). Add
+  `upstream` = `https://github.com/ggml-org/llama.cpp` explicitly if you ever need to compare against
+  raw ggml-org master.
+- Branches: `feature/turboquant-kv-cache` = the upstream TurboQuant fork; work happens on a branch on
+  top of it (currently `feature/v100-fa-port`, which is where the V100 work and the two fork bug fixes
+  live).
+- Syncing upstream is a plain merge: `git fetch origin && git merge origin/feature/turboquant-kv-cache`.
+  Upstream master is always fully contained in the tree, and `git log` is the record of the last sync
+  point. Merges have been conflict-free; the one repeated overlap to expect is `fattn-vec.cuh` /
+  `fattn.cu` / `template-instances/fattn-vec-instance-*.cu`, where upstream and this fork have twice
+  fixed the same D512 VEC ptxas smem overflow. Upstream's `GGML_USE_HIP` guard won; do not re-add a
+  fork-side stub there.
+- After any sync, rebuild and gate on both boxes: `./sync-73.sh --rebuild` plus
+  `v100-优化存档/gate-v100.sh` for sm_70, and `./run-2070.sh sm75-优化存档/gate-2070.sh` for sm_75.
 
 ### Known pitfalls (each caused a real bug once - check these first on regressions)
 
