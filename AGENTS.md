@@ -67,7 +67,13 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
   script there with stdin closed (`llama-cli` otherwise eats the remaining script lines and the log
   silently ends early). `./run-2070.sh sm75-优化存档/gate-2070.sh` is the standard FATTN gate.
 - The V100 box (192.168.7.3, sm_70, 32 GB) stays the large-model/long-context
-  validation environment (Qwen3.8-27B IQ4_XS etc.).
+  validation environment (Qwen3.8-27B IQ4_XS etc.). `ssh -i ~/.ssh/id_rsa lbp@192.168.7.3`.
+- **On the V100, `-b 2048 -ub 2048` is worth +20~33% prefill and +8% decode.**
+  `n_ubatch` defaults to 512, and on Volta prefill always goes through
+  "dequantize the weights to f16, then cuBLAS" (`MMQ_DP4A_MAX_BATCH_SIZE` gate in
+  `ggml-cuda/mmq.cu`), so the dequant cost is `ceil(prompt/ub) x weight bytes` and
+  grows with context. Confirmed on `llama-server` at 15k tokens: 694.7 -> 840.7 tok/s
+  (+21.0%). Evidence, raw logs and a rerun script: `v100-优化存档/`.
 - Volta/SM75 FA work lives on branch `feature/v100-fa-port`
   (`ggml-cuda/fattn-v100.cuh` + the graph null-deref fix).
 - **SM75 gotcha (cost a full debug session): the 1Cat WMMA fragment ->
@@ -122,6 +128,11 @@ fork's turbo KV family in spirit (both bound KV bytes on Turing-class cards).
 | `LLAMA_ATTN_ROT_K/V_OVERRIDE` | off   | Optional upstream attention rotation (TurboQuant manages its own rotation) |
 | `GGML_V100_FA`              | V100: on, 2070: off | Fork Volta/Turing FA kernel (`fattn-v100.cuh`). On the 2070 it measured 8-15% slower than upstream's `fattn-mma-f16.cuh` at every prefill length, with the gap growing in context, so sm_75 defaults to the upstream kernel; `=1` / `=0` override either way |
 | `GGML_V100_FA_MMA`          | unset    | Route B mma engine inside the fork FA kernel (needs `GGML_V100_FA=1` as well). Correct but still slower: opt-in research build |
+| `GGML_CUDA_FORCE_MMQ`       | unset    | Route prefill GEMM through fused mmq instead of dequant+cuBLAS. On the V100 it is only worth it together with a large `-ub`: +0.5~1.3% at `-ub 2048`, but **-5.2% at `-ub 512`**. Do not enable globally |
+| `GGML_TQ_MMQ`               | unset    | Native TQ prefill mmq path (`ggml-cuda.cu:1968`). Same mechanism as `GGML_CUDA_FORCE_MMQ`, for TQ3_1S/TQ4_1S weights. Untested |
+
+Note: `-ub` is a CLI flag, not an env var, but it belongs in this table's spirit - see
+`v100-优化存档/README.md` for the V100 numbers.
 
 ### Test gates (all must pass before touching quant/backend code)
 
