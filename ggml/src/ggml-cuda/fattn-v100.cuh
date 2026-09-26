@@ -261,6 +261,13 @@ __device__ __forceinline__ void regs_o_rescale(
 // blockDim.x=256 every warp but warp0 would read shifted columns.
 __device__ __forceinline__ void ldm16x8_swz(ggml_cuda_mma::tile<16, 8, half2> & t,
         const half2 * base, const int base_row, const int base_col_h2, const int stride_h2) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < GGML_CUDA_CC_TURING
+    // ldmatrix is sm_75+. The mma engine is only launched on Turing, but the
+    // template is instantiated for every compiled arch, so the body must not
+    // emit ldmatrix on sm_70 or ptxas rejects the whole fattn.cu translation unit.
+    NO_DEVICE_CODE;
+    GGML_UNUSED_VARS(t, base, base_row, base_col_h2, stride_h2);
+#else
     const int lane = threadIdx.x & 31;
     const int row = base_row + (lane % 16);
     uint32_t byte_off = (uint32_t) ((row * stride_h2 + base_col_h2 + (lane / 16) * 4) * (int) sizeof(half2));
@@ -270,10 +277,15 @@ __device__ __forceinline__ void ldm16x8_swz(ggml_cuda_mma::tile<16, 8, half2> & 
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
         : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
         : "l"(addr));
+#endif
 }
 
 __device__ __forceinline__ void ldm16x8_swz_trans(ggml_cuda_mma::tile<16, 8, half2> & t,
         const half2 * base, const int base_row, const int base_col_h2, const int stride_h2) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < GGML_CUDA_CC_TURING
+    NO_DEVICE_CODE;
+    GGML_UNUSED_VARS(t, base, base_row, base_col_h2, stride_h2);
+#else
     const int lane = threadIdx.x & 31;
     const int row = base_row + (lane % 16);
     uint32_t byte_off = (uint32_t) ((row * stride_h2 + base_col_h2 + (lane / 16) * 4) * (int) sizeof(half2));
@@ -283,6 +295,7 @@ __device__ __forceinline__ void ldm16x8_swz_trans(ggml_cuda_mma::tile<16, 8, hal
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.b16 {%0, %1, %2, %3}, [%4];"
         : "=r"(xi[0]), "=r"(xi[2]), "=r"(xi[1]), "=r"(xi[3])
         : "l"(addr));
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1176,10 +1189,14 @@ static bool ggml_cuda_flash_attn_ext_v100_enabled(const int cc) {
     if (env >= 0) {
         return env == 1;
     }
-    // Default: Volta keeps the fork kernel. On Turing (the 2070) it measured
-    // 8-15% slower than the upstream mma kernel at every prefill length and
-    // the gap grows with context, so the upstream kernel wins there.
-    return cc == GGML_CUDA_CC_VOLTA;
+    // Default: opt-in on both Volta and Turing. Measured back-to-back against
+    // upstream's fattn-mma-f16.cuh with the tuned batch config (-b 2048 -ub 2048):
+    // V100 pp2048 -3.4%, pp16384 -20.9%, pp65536 about -38%; 2070 -8% at pp4096
+    // growing to -15% at pp16384. This kernel only ever handles f16 K/V (see the
+    // gate below), so turbo KV does not depend on it. Use GGML_V100_FA=1 for the
+    // research kernel.
+    GGML_UNUSED(cc);
+    return false;
 }
 
 bool ggml_cuda_flash_attn_ext_v100_available(const ggml_tensor * dst) {

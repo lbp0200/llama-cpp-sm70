@@ -917,6 +917,42 @@ graph 空指针 491ecdd04），不是提速项。
 因此 `GGML_V100_FA` 的默认值理应也为 OFF（与 2070 同理）；当前代码仍是 `cc == VOLTA` 默认开，
 **因 V100 离线无法复测而暂不翻转**，留待机器回线后重测 A/B 再定（或按用户指示直接翻转）。
 
+### 已定案：V100 默认值已翻转为 OFF（2026-09-26）
+
+V100 回线后补做了那个被搁置的 A/B，并且这次带上了后来才拿到的调优批配置
+（`-b 2048 -ub 2048`）。交替两轮，同向一致：
+
+| prompt | `GGML_V100_FA=0`（上游） | `=1`（fork） | 差距 |
+|---|---|---|---|
+| pp2048 | 1055.4 | 1019.8 | **-3.4%** |
+| pp16384 | 904.8 | 715.7 | **-20.9%** |
+| pp65536 | 579.6 | 364.7 | **-37.1%** |
+| tg128 | 37.84 | 37.45 | -1.0%（解码不走该闸门）|
+
+pp65536 的 -37% 与早前 `-ub 512` 下测的 -38%（288.9 vs 468.4）几乎一致：**那个数字一直是对的，
+错的是默认值。** 因此 `ggml_cuda_flash_attn_ext_v100_enabled()` 已改为默认返回 false，
+`GGML_V100_FA=1` 才启用。安全：该内核的闸门要求 `K/V == GGML_TYPE_F16`，turbo KV 走自己的路径
+（`fattn-mma-turbo.cuh`），不受影响 —— 已在 V100 上用默认派发跑通 turbo3/turbo4（输出与 f16 一致）。
+
+原始数据：`v100-优化存档/fa-default-ab-2026-09-26.log`。
+
+### 顺带修掉一个潜伏的编译断裂（2026-09-26）
+
+把 Mac 的树同步到 V100 后重编译，**sm_70 直接编不过**：
+
+```
+ptxas error: Feature 'ldmatrix' requires .target sm_75 or higher
+ptxas fatal: Ptx Assembly aborted due to errors
+  during instantiation of ggml_cuda_flash_attn_ext_v100_launch<CFG=cfg_sm75_pair_mma>
+```
+
+route B 引擎的 `ldm16x8_swz` / `ldm16x8_swz_trans` 用了 `ldmatrix`（sm_75+），而模板会为每个编译
+架构实例化，于是 sm_70 的 ptxas 直接拒了整个 `fattn.cu`。**这个断裂一直潜伏**：route B 只在 2070
+（sm_75）上编译验证过，V100 侧从未在 route B 落地后重编过（campaign log 里「sm_70 验证 route B」
+本来就是待办，因为当时 V100 离线）。修法沿用本仓库既有的 stub 模式：在两个 helper 里加
+`__CUDA_ARCH__ < GGML_CUDA_CC_TURING` 的 `NO_DEVICE_CODE` 分支。修后 V100 全量编译通过，
+门禁 470/470 x3 + sweep 7747/7747 全绿，**route B 引擎在 sm_70 上也首次通过 470/470**。
+
 ### 谱系澄清：`fattn-v100.cuh` 到底是不是「1Cat split-D WMMA 的移植」（2026-09-24）
 
 文件自己的头部（`fattn-v100.cuh:3-13`）写的是 **「1Cat FLASH_ATTN_V100 dataflow ported to ggml」**，
@@ -996,5 +1032,10 @@ mma.sync + per-arch 配置表）把这个空间占了，且在我们两台机器
 ### 若要清理
 
 把本分支还原成「纯 TurboQuant fork」只需回退 `fattn-v100.cuh` + `fattn.cu` 那 9 行闸门
-（其余 43 个提交全是文档/工具/探针）。两条默认值都已安全（2070 走上游；V100 仍默认 fork 内核是无据的
-遗留项，机器离线故未翻）。生产服务未改动，无凭据遗留。
+（其余 43 个提交全是文档/工具/探针）。**两条默认值现在都已安全**：2070 走上游，V100 也已翻转为
+opt-in（2026-09-26，见上文 A/B）。生产服务未改动，无凭据遗留。
+
+保留 `fattn-v100.cuh` 本身是可选项，不是必需项：它是**正确**的（两条架构都 470/470）但**更慢**
+（V100 -3~-37%，2070 -8~-15%），且现在只是 opt-in。删它的代价是丢掉一个已验证的研究产物，
+收益是少 1387 行死代码；两者都合理，决定权留给使用者。**必须保留**的是同分支里两个真 bug 修复：
+`fattn-vec.cuh` 的 D512 VEC sm_70/75 编译 stub、`ggml-cuda.cu` 的 CUDA graph 空指针保护。

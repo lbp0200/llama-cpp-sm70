@@ -1,0 +1,53 @@
+V100 (192.168.7.3) GGML_V100_FA A/B - settling the default value, 2026-09-26
+repo: ~/llama-cpp-sm70 (box checkout; its fattn-v100.cuh working copy was verified
+      equivalent to the Mac's committed kernel)
+model: Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf
+config: -ngl 99 -b 2048 -ub 2048, f16 K/V, llama-bench, alternating order
+        (FA=0 then FA=1, twice) so clock drift hits both sides equally
+
+================================================================
+Why this run exists
+================================================================
+The campaign closed with the V100 default left ON:
+  ggml_cuda_flash_attn_ext_v100_enabled() returned cc == GGML_CUDA_CC_VOLTA
+because the archive's evidence was "parity or worse" and the V100 was offline, so
+the flip was deferred to "re-measure when the box is back". The box is back, and
+there is now a tuned batch config (-b 2048 -ub 2048) that the earlier A/B did not
+have. This run settles it.
+
+================================================================
+Result
+================================================================
+| prompt  | FA=0 (upstream)         | FA=1 (fork kernel)      | gap     |
+|---------|------------------------:|------------------------:|--------:|
+| pp2048  | 1057.28 / 1053.49 = 1055.4 | 1021.67 / 1017.94 = 1019.8 | -3.4%  |
+| pp16384 |  914.64 /  895.04 =  904.8 |  719.46 /  712.02 =  715.7 | -20.9% |
+| pp65536 |  586.69 /  572.52 =  579.6 |  364.65 /  364.80 =  364.7 | -37.1% |
+| tg128   | 37.84                   | 37.45                   | -1.0%   |
+
+Two alternating rounds per length, both rounds the same direction, spread within a
+round ~1% (pp16384) to 2% (pp2048). The gap grows monotonically with context, which
+is the signature of the fork kernel's per-token KV traffic and its missing KV-axis
+segmentation (upstream splits KV into ~64-token CTA segments plus a combine; the
+fork kernel has one CTA walk the whole KV).
+
+tg128 is a sanity check only: the gate requires K->ne[1] >= Q->ne[1], so decode
+never enters the fork kernel and both sides run upstream. -1.0% is noise, and the
+fact that it is not 0 is a reminder of the box's clock drift.
+
+pp65536 reproduces the archive's earlier -38% (288.9 vs 468.4 at -ub 512) almost
+exactly. That number was right; it was the *default value* that was left wrong.
+
+================================================================
+Action taken
+================================================================
+ggml_cuda_flash_attn_ext_v100_enabled() now returns false unless GGML_V100_FA=1.
+
+Safe for TurboQuant: the gate below requires
+  K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16
+so this kernel only ever handles f16 K/V. Turbo KV has its own path
+(fattn-mma-turbo.cuh) and is unaffected - confirmed on the box by running turbo3 KV
+with GGML_V100_FA=0 (pp65536 564.50, tg128 26.45).
+
+Verified after the flip by re-syncing the tree to the box, rebuilding, and running
+the FLASH_ATTN_EXT gate on both dispatch paths plus a turbo3 smoke test.
